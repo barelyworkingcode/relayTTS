@@ -1,0 +1,59 @@
+# relayTTS daemon configuration.
+#
+# Voices and per-voice delivery (`instruct`) are externalized here so they can be
+# tuned without touching daemon code. The daemon reads this once at startup
+# (override the path with the RELAYTTS_CONFIG env var).
+#
+# Engine: Qwen3-TTS CustomVoice on Apple Silicon via mlx-audio. `speaker` is the
+# model's native speaker id (from the model's talker_config.spk_id); `instruct`
+# is that voice's default emotion/delivery. A per-request `instruct` overrides
+# the voice default. Qwen3's native speed= is a no-op, so the daemon applies a
+# pitch-preserving ffmpeg time-stretch for any speed != 1.0.
+
+engine:
+  repo_id: mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit
+  sample_rate: 24000
+  lang_code: english
+  temperature: 0.9
+
+# Voice used when a request omits `voice` or sends an unknown id.
+default_voice: anna
+
+# Delivery used when neither the request nor the resolved voice specifies one.
+default_instruct: "Warm, mature and composed, gently amused."
+
+# Exposed verbatim via the `list_voices` action, in the kokoro-compatible shape
+# {id, name, lang, gender}. `speaker` = the Qwen3 CustomVoice speaker that
+# actually renders this voice; `instruct` = this voice's default delivery.
+# English-capable voices are listed first (Anna is the default).
+voices:
+  - {id: anna,     name: Anna,     lang: English, gender: F, speaker: ono_anna, instruct: "Warm, mature and composed, gently amused."}
+  - {id: ryan,     name: Ryan,     lang: English, gender: M, speaker: ryan,     instruct: "Confident, clear and friendly."}
+  - {id: aiden,    name: Aiden,    lang: English, gender: M, speaker: aiden,    instruct: "Relaxed, warm and conversational."}
+  - {id: sohee,    name: Sohee,    lang: English, gender: F, speaker: sohee,    instruct: "Bright, gentle and expressive."}
+  - {id: serena,   name: Serena,   lang: Chinese, gender: F, speaker: serena,   instruct: "Warm and composed."}
+  - {id: vivian,   name: Vivian,   lang: Chinese, gender: F, speaker: vivian,   instruct: "Lively and friendly."}
+  - {id: uncle_fu, name: Uncle Fu, lang: Chinese, gender: M, speaker: uncle_fu, instruct: "Avuncular, steady and warm."}
+  - {id: eric,     name: Eric,     lang: Chinese, gender: M, speaker: eric,     instruct: "Clear and measured."}
+  - {id: dylan,    name: Dylan,    lang: Chinese, gender: M, speaker: dylan,    instruct: "Easygoing and upbeat."}
+
+# Legacy Kokoro voice ids -> relayTTS voice ids. Lets clients (and any persisted
+# voice preference) that still send Kokoro ids keep working as a true drop-in.
+# Anything not matched here and not a known voice/speaker falls back to
+# default_voice, so old prefs never error.
+voice_aliases:
+  af_heart: anna
+  af_bella: anna
+  af_alloy: anna
+  af_aoede: anna
+  af_nicole: sohee
+  af_sarah: sohee
+  bf_emma: anna
+  bf_alice: anna
+  am_michael: ryan
+  am_adam: ryan
+  am_eric: ryan
+  am_onyx: aiden
+  am_liam: aiden
+  bm_george: aiden
+  bm_daniel: aiden

@@ -1,0 +1,20 @@
+# Top-level runtime dependencies for the relayTTS daemon — intent, not the lock.
+#
+# Edit this file to change a dependency, then regenerate the hash-pinned lockfile:
+#
+#   pip-compile --generate-hashes --allow-unsafe --output-file requirements.txt requirements.in
+#
+# After recompiling, re-run the concurrency smoke test before committing the new lockfile.
+#
+# NOTE: espeak-ng, misaki, phonemizer, spacy, and num2words are intentionally
+# NOT listed here. Those are Kokoro G2P dependencies — Qwen3-TTS has no
+# phonemizer step and speaks directly from raw text.
+#
+# ffmpeg (brew install ffmpeg) is required at runtime for pitch-preserving
+# time-stretch but is a system binary, not a pip package.
+
+mlx-audio>=0.4.4    # Qwen3-TTS / qwen3_tts model support landed in 0.4.4; Apple Silicon MLX
+mlx                  # MLX core (pulled transitively by mlx-audio; listed explicitly for clarity)
+soundfile            # WAV encoding / decoding
+numpy
+pyyaml               # the daemon reads config.yaml for voice definitions at startup

@@ -1,0 +1,7 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Local virtualenvs (the daemon runs from a conda env created by setup_env.sh)
+.venv/
+venv/
