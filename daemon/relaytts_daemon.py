@@ -65,6 +65,10 @@ class Config:
         self.sample_rate = int(engine.get("sample_rate", 24000))
         self.lang_code = engine.get("lang_code", "english")
         self.temperature = float(engine.get("temperature", 0.9))
+        # Qwen3 Base checkpoint used for voice cloning (kind="clone"). A separate
+        # model from the CustomVoice one above; loaded lazily on first clone use.
+        self.clone_repo_id = engine.get(
+            "clone_repo_id", "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-6bit")
 
         self.default_voice = raw.get("default_voice", "anna")
         self.default_instruct = raw.get(
@@ -96,7 +100,7 @@ class Config:
             return
         try:
             with open(self.custom_voices_path, "w") as f:
-                json.dump({"voices": []}, f, indent=2)
+                json.dump({"voices": [], "clones": []}, f, indent=2)
             print(f"Seeded empty custom voices file: {self.custom_voices_path}")
         except OSError as e:
             print(f"Could not seed {self.custom_voices_path}: {e}")
@@ -130,46 +134,83 @@ class Config:
             print(f"custom voice entry skipped ({e})")
             return None
 
-    def _load_custom(self) -> list:
+    def _normalize_clone(self, entry: dict) -> dict | None:
+        """Coerce one `clones` row into a clone render spec, or None if unusable.
+
+        A clone voice = a reference recording (`ref_audio`, a 24 kHz WAV path) +
+        its transcript (`ref_text`); the Base model reproduces that speaker. We
+        require the fields to be present but DON'T stat the file here (it may be
+        added after the entry) — synth validates the path at use time."""
+        try:
+            vid = str(entry.get("id", "")).strip()
+            ref_audio = str(entry.get("ref_audio") or "").strip()
+            ref_text = entry.get("ref_text")
+            ref_text = str(ref_text).strip() if ref_text else ""
+            if not vid:
+                return None
+            if not ref_audio or not ref_text:
+                print(f"clone voice {vid!r}: needs ref_audio and ref_text; skipping")
+                return None
+            return {
+                "id": vid,
+                "name": str(entry.get("name") or vid),
+                "lang": str(entry.get("lang") or "English"),
+                "gender": str(entry.get("gender") or "F"),
+                "ref_audio": ref_audio,
+                "ref_text": ref_text,
+                "gain": _safe_float(entry.get("gain"), 1.0),
+                "speed": _safe_float(entry.get("speed"), 1.0),
+                "kind": "clone",
+            }
+        except Exception as e:
+            print(f"clone voice entry skipped ({e})")
+            return None
+
+    def _read_dynamic(self) -> tuple:
+        """Read voices.json once and return (custom_voices, clone_voices)."""
         try:
             with open(self.custom_voices_path) as f:
                 data = json.load(f) or {}
         except FileNotFoundError:
-            return []
+            return [], []
         except (OSError, json.JSONDecodeError) as e:
             print(f"custom voices: cannot read {self.custom_voices_path}: {e}; ignoring")
-            return []
+            return [], []
         known = {v["speaker"] for v in self._builtin}
-        out = []
-        for entry in (data.get("voices") or []):
-            v = self._normalize_custom(entry, known) if isinstance(entry, dict) else None
-            if v:
-                out.append(v)
-        return out
+        custom = [self._normalize_custom(e, known)
+                  for e in (data.get("voices") or []) if isinstance(e, dict)]
+        clones = [self._normalize_clone(e)
+                  for e in (data.get("clones") or []) if isinstance(e, dict)]
+        return [v for v in custom if v], [v for v in clones if v]
 
     def reload_custom(self) -> int:
-        """Rebuild the merged registry from built-ins + current voices.json.
-        Returns the count of custom voices loaded. Custom ids override built-ins."""
-        custom = self._load_custom()
+        """Rebuild the merged registry from built-ins + voices.json (custom +
+        clones). Returns the count of dynamic (non-built-in) voices loaded.
+        Dynamic ids override built-ins on collision."""
+        custom, clones = self._read_dynamic()
         merged, order = {}, []
-        for v in self._builtin + custom:
+        for v in self._builtin + custom + clones:
             if v["id"] not in merged:
                 order.append(v["id"])
-            merged[v["id"]] = v  # custom (later) wins on id collision
+            merged[v["id"]] = v  # dynamic (later) wins on id collision
         voices = [merged[i] for i in order]
         # by_speaker only maps built-in speakers (a raw speaker name resolves to
-        # its canonical preset voice, not to a custom restyle of it).
+        # its canonical preset voice, not to a custom/clone voice).
         self._reg = {
             "voices": voices,
             "by_id": {v["id"]: v for v in voices},
             "by_speaker": {v["speaker"]: v for v in voices if v["kind"] == "preset"},
         }
-        return len(custom)
+        return len(custom) + len(clones)
 
     def voice_counts(self) -> dict:
-        voices = self._reg["voices"]
-        builtin = sum(1 for v in voices if v["kind"] == "preset")
-        return {"builtin": builtin, "custom": len(voices) - builtin, "total": len(voices)}
+        c = {"builtin": 0, "custom": 0, "clone": 0}
+        for v in self._reg["voices"]:
+            key = {"preset": "builtin", "custom": "custom", "clone": "clone"}.get(
+                v["kind"], "builtin")
+            c[key] += 1
+        c["total"] = len(self._reg["voices"])
+        return c
 
     def public_voices(self) -> list:
         """The kokoro-compatible {id,name,lang,gender} list for list_voices."""
@@ -193,11 +234,15 @@ class Config:
         v = (reg["by_id"].get(voice)
              or reg["by_speaker"].get(voice)
              or reg["by_id"][self.default_voice])
+        kind = v.get("kind", "preset")
+        common = {"kind": kind, "gain": v.get("gain", 1.0), "speed": v.get("speed", 1.0)}
+        if kind == "clone":
+            # Cloning is driven by the reference recording, not a speaker/instruct.
+            return {**common, "ref_audio": v.get("ref_audio"), "ref_text": v.get("ref_text")}
         return {
+            **common,
             "speaker": v["speaker"],
             "instruct": v.get("instruct") or self.default_instruct,
-            "gain": v.get("gain", 1.0),
-            "speed": v.get("speed", 1.0),
         }
 
 
@@ -274,6 +319,12 @@ class RelayTTSDaemon:
         self._start_time = None
         self._last_rtf = None
         self._voices_mtime = None
+        # Qwen3 Base model for cloning (kind="clone"). Loaded lazily on the
+        # generation thread on first clone request, so its RAM is only paid if
+        # cloning is actually used. Driven from the same single thread as the
+        # CustomVoice model (MLX's cross-thread constraint is per-process, not
+        # per-model), so the two coexist safely.
+        self._clone_model = None
 
     def update_activity(self):
         with self.activity_lock:
@@ -326,6 +377,18 @@ class RelayTTSDaemon:
         except Exception as e:
             print(f"Warmup failed (non-fatal): {e}")
 
+    def _ensure_clone_model(self):
+        """Return the Base model for cloning, loading it on first use. MUST be
+        called from the generation thread (it is — invoked inside a _generate
+        closure run via _run_on_worker), so MLX loads it on the same thread that
+        drives it. The first clone request pays the load + encode cost."""
+        if self._clone_model is None:
+            print(f"Loading Qwen3-TTS Base (clone) model: {self.cfg.clone_repo_id} ...")
+            from mlx_audio.tts.utils import load_model
+            self._clone_model = load_model(self.cfg.clone_repo_id)
+            print("Clone model loaded.")
+        return self._clone_model
+
     # ── Single generation thread (MLX must be driven from one thread) ──
 
     def _generation_worker(self):
@@ -368,30 +431,58 @@ class RelayTTSDaemon:
         delivery (instruct + gain + speed) come through; an explicit value from
         the Director still wins per-span."""
         spec = self.cfg.resolve(voice)
-        speaker = spec["speaker"]
-        instruct = instruct or spec["instruct"]
         speed = spec["speed"] if speed is None else speed
         gain = spec["gain"] if gain is None else gain
         lang_code = lang_code or self.cfg.lang_code
 
         t0 = time.time()
 
-        # Run the actual MLX generation on the dedicated generation thread
-        # (np.asarray() forces MLX's lazy eval, so the Metal compute happens
-        # inside the closure, on that thread). WAV encoding/base64 below operate
-        # on local data and stay on the client thread, so overlapping requests
-        # can finish encoding in parallel.
-        def _generate():
-            segs = []
-            for result in self.model.generate(
-                text=text,
-                voice=speaker,
-                instruct=instruct,
-                lang_code=lang_code,
-                temperature=self.cfg.temperature,
-            ):
-                segs.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
-            return segs
+        # Build the generation closure. It runs on the dedicated generation thread
+        # (np.asarray() forces MLX's lazy eval, so the Metal compute happens inside
+        # the closure, on that thread). WAV encoding/base64 below operate on local
+        # data and stay on the client thread, so overlapping requests can finish
+        # encoding in parallel.
+        if spec["kind"] == "clone":
+            # Cloning uses the Base model with reference audio + transcript; the
+            # speaker comes from the recording, so voice/instruct don't apply.
+            ref_audio, ref_text = spec.get("ref_audio"), spec.get("ref_text")
+            if not ref_audio or not os.path.isfile(ref_audio):
+                raise RuntimeError(
+                    f"clone voice {voice!r}: ref_audio not found: {ref_audio!r}")
+            if not ref_text:
+                raise RuntimeError(f"clone voice {voice!r}: ref_text is required")
+
+            def _generate():
+                model = self._ensure_clone_model()
+                segs = []
+                for result in model.generate(
+                    text=text,
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    lang_code=lang_code,
+                    temperature=self.cfg.temperature,
+                ):
+                    segs.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
+                return segs
+
+            descr = f"clone:{os.path.basename(ref_audio)}"
+        else:
+            speaker = spec["speaker"]
+            instruct = instruct or spec["instruct"]
+
+            def _generate():
+                segs = []
+                for result in self.model.generate(
+                    text=text,
+                    voice=speaker,
+                    instruct=instruct,
+                    lang_code=lang_code,
+                    temperature=self.cfg.temperature,
+                ):
+                    segs.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
+                return segs
+
+            descr = f"speaker={speaker}"
 
         segments = self._run_on_worker(_generate)
 
@@ -420,7 +511,7 @@ class RelayTTSDaemon:
         rtf = generation_time / duration if duration > 0 else 0
         self._last_rtf = round(rtf, 3)
         print(f"Generated: {duration:.2f}s audio in {generation_time:.2f}s "
-              f"(RTF: {rtf:.2f}x) voice={voice or self.cfg.default_voice} speaker={speaker}")
+              f"(RTF: {rtf:.2f}x) voice={voice or self.cfg.default_voice} {descr}")
 
         return wav_bytes, {
             "sample_rate": self.cfg.sample_rate,

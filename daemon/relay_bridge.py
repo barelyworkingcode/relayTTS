@@ -87,6 +87,45 @@ def build_voice_schema(speakers: list) -> list:
     }]
 
 
+def build_clone_schema() -> list:
+    """The ConfigDecl schema for cloned voices (the `clones` array).
+
+    A clone voice = a reference recording (`ref_audio`, a 24 kHz WAV path) + its
+    transcript (`ref_text`); the Base model reproduces that speaker. Reference
+    audio comes in by file path because Relay's inspector edits config text and
+    can't take uploads. Delivery comes from the sample's prosody — `instruct`
+    does not apply (so there's no instruct field here)."""
+    return [{
+        "id": "clones",
+        "label": "Cloned voices",
+        "type": "array",
+        "help": ("Voices cloned from a reference recording. Provide a 24 kHz WAV "
+                 "and its exact transcript. Uses the Qwen3 Base model, loaded on "
+                 "first use. Delivery follows the sample's prosody (no instruct)."),
+        "item": {
+            "id": "clone",
+            "type": "object",
+            "fields": [
+                {"id": "id", "label": "Voice ID", "type": "text", "required": True,
+                 "help": "Unique id Eve stores and sends back (e.g. 'my_voice')."},
+                {"id": "name", "label": "Display name", "type": "text", "required": True},
+                {"id": "ref_audio", "label": "Reference audio (path)", "type": "text",
+                 "required": True,
+                 "help": "Absolute path to a 24 kHz mono WAV of the voice to clone."},
+                {"id": "ref_text", "label": "Reference transcript", "type": "textarea",
+                 "required": True, "help": "The exact words spoken in the reference audio."},
+                {"id": "lang", "label": "Language", "type": "text", "placeholder": "English",
+                 "help": "Groups the voice in Eve's picker."},
+                {"id": "gender", "label": "Gender", "type": "select", "options": ["F", "M"]},
+                {"id": "gain", "label": "Gain", "type": "number",
+                 "help": "Loudness multiplier (1.0 unchanged)."},
+                {"id": "speed", "label": "Speed", "type": "number",
+                 "help": "Tempo multiplier (1.0 unchanged; pitch preserved)."},
+            ],
+        },
+    }]
+
+
 def build_manifest(service_id: str, config_path: str, speakers: list) -> dict:
     """Assemble the manifest relay validates and stores.
 
@@ -107,7 +146,7 @@ def build_manifest(service_id: str, config_path: str, speakers: list) -> dict:
             "help": ("Custom voices for relayTTS — they appear in Eve's voice "
                      "picker. Built-in voices live in config.yaml."),
             "applyMode": "live",
-            "schema": build_voice_schema(speakers),
+            "schema": build_voice_schema(speakers) + build_clone_schema(),
         },
     }
 

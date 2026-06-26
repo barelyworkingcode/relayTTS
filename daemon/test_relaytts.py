@@ -33,14 +33,14 @@ voice_aliases:
 """
 
 
-def _make_config(tmp_dir, custom=None):
+def _make_config(tmp_dir, custom=None, clones=None):
     cfg_path = os.path.join(tmp_dir, "config.yaml")
     with open(cfg_path, "w") as f:
         f.write(CONFIG_YAML)
     voices_path = os.path.join(tmp_dir, "voices.json")
-    if custom is not None:
+    if custom is not None or clones is not None:
         with open(voices_path, "w") as f:
-            json.dump({"voices": custom}, f)
+            json.dump({"voices": custom or [], "clones": clones or []}, f)
     return Config(cfg_path, custom_voices_path=voices_path)
 
 
@@ -48,14 +48,15 @@ def test_seeds_empty_voices_file(tmp_path):
     cfg = _make_config(str(tmp_path))
     assert os.path.exists(cfg.custom_voices_path)
     with open(cfg.custom_voices_path) as f:
-        assert json.load(f) == {"voices": []}
-    assert cfg.voice_counts() == {"builtin": 2, "custom": 0, "total": 2}
+        assert json.load(f) == {"voices": [], "clones": []}
+    assert cfg.voice_counts() == {"builtin": 2, "custom": 0, "clone": 0, "total": 2}
 
 
 def test_builtin_resolve_defaults(tmp_path):
     cfg = _make_config(str(tmp_path))
     spec = cfg.resolve("ryan")
-    assert spec == {"speaker": "ryan", "instruct": "Confident.", "gain": 1.0, "speed": 1.0}
+    assert spec == {"kind": "preset", "speaker": "ryan", "instruct": "Confident.",
+                    "gain": 1.0, "speed": 1.0}
 
 
 def test_alias_and_unknown_fallback(tmp_path):
@@ -82,9 +83,10 @@ def test_custom_voice_with_known_speaker(tmp_path):
         {"id": "narrator", "name": "Narrator", "lang": "English", "gender": "M",
          "base_speaker": "ryan", "instruct": "Gravelly and slow.", "gain": 1.3, "speed": 0.9},
     ])
-    assert cfg.voice_counts() == {"builtin": 2, "custom": 1, "total": 3}
+    assert cfg.voice_counts() == {"builtin": 2, "custom": 1, "clone": 0, "total": 3}
     spec = cfg.resolve("narrator")
-    assert spec == {"speaker": "ryan", "instruct": "Gravelly and slow.", "gain": 1.3, "speed": 0.9}
+    assert spec == {"kind": "custom", "speaker": "ryan", "instruct": "Gravelly and slow.",
+                    "gain": 1.3, "speed": 0.9}
     ids = [v["id"] for v in cfg.public_voices()]
     assert ids == ["anna", "ryan", "narrator"]   # built-ins first, in order
 
@@ -123,6 +125,57 @@ def test_reload_custom_picks_up_changes(tmp_path):
 def test_speakers_list_for_schema(tmp_path):
     cfg = _make_config(str(tmp_path))
     assert cfg.speakers == ["ono_anna", "ryan"]
+
+
+# ── clone voices ──────────────────────────────────────────────────
+
+def test_clone_voice_loaded_and_resolved(tmp_path):
+    cfg = _make_config(str(tmp_path), clones=[
+        {"id": "my_voice", "name": "My Voice", "lang": "English", "gender": "M",
+         "ref_audio": "/some/ref.wav", "ref_text": "Hello there.", "gain": 1.1, "speed": 1.0},
+    ])
+    assert cfg.voice_counts() == {"builtin": 2, "custom": 0, "clone": 1, "total": 3}
+    spec = cfg.resolve("my_voice")
+    assert spec == {"kind": "clone", "ref_audio": "/some/ref.wav",
+                    "ref_text": "Hello there.", "gain": 1.1, "speed": 1.0}
+    assert [v["id"] for v in cfg.public_voices()] == ["anna", "ryan", "my_voice"]
+    # clone speakers must NOT pollute by_speaker (no "speaker" key on clones)
+    assert cfg.resolve("ono_anna")["kind"] == "preset"
+
+
+def test_clone_requires_ref_audio_and_text(tmp_path):
+    cfg = _make_config(str(tmp_path), clones=[
+        {"id": "no_audio", "ref_text": "hi"},                 # missing ref_audio
+        {"id": "no_text", "ref_audio": "/x.wav"},             # missing ref_text
+        {"ref_audio": "/y.wav", "ref_text": "hi"},            # missing id
+        {"id": "ok", "ref_audio": "/z.wav", "ref_text": "ok"},
+    ])
+    assert cfg.voice_counts()["clone"] == 1
+    assert cfg.resolve("ok")["ref_audio"] == "/z.wav"
+
+
+def test_custom_and_clone_coexist(tmp_path):
+    cfg = _make_config(
+        str(tmp_path),
+        custom=[{"id": "narrator", "base_speaker": "ryan", "instruct": "Slow."}],
+        clones=[{"id": "cloned", "ref_audio": "/r.wav", "ref_text": "hi"}],
+    )
+    assert cfg.voice_counts() == {"builtin": 2, "custom": 1, "clone": 1, "total": 4}
+
+
+def test_build_clone_schema_shape():
+    schema = relay_bridge.build_clone_schema()
+    assert schema[0]["id"] == "clones" and schema[0]["type"] == "array"
+    fields = {f["id"]: f for f in schema[0]["item"]["fields"]}
+    assert fields["ref_audio"]["required"] is True
+    assert fields["ref_text"]["type"] == "textarea"
+    assert "base_speaker" not in fields and "instruct" not in fields  # not for clones
+
+
+def test_manifest_includes_both_arrays():
+    m = relay_bridge.build_manifest("svc", "/abs/v.json", ["a"])
+    ids = [f["id"] for f in m["config"]["schema"]]
+    assert ids == ["voices", "clones"]
 
 
 # ── relay_bridge pure helpers ─────────────────────────────────────

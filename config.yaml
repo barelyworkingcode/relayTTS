@@ -15,6 +15,11 @@ engine:
   sample_rate: 24000
   lang_code: english
   temperature: 0.9
+  # Qwen3 Base checkpoint for voice cloning (kind="clone" voices in voices.json).
+  # A separate model from repo_id above, loaded lazily on the first clone request
+  # so its RAM is only paid when cloning is used. Swap the quant here to trade
+  # fidelity for RAM (0.6B is lighter, bf16 is heavier/higher quality).
+  clone_repo_id: mlx-community/Qwen3-TTS-12Hz-1.7B-Base-6bit
 
 # Voice used when a request omits `voice` or sends an unknown id.
 default_voice: anna
