@@ -5,3 +5,6 @@ __pycache__/
 # Local virtualenvs (the daemon runs from a conda env created by setup_env.sh)
 .venv/
 venv/
+
+# Session scratch / resume notes (not part of the project)
+SUMMARY.md
