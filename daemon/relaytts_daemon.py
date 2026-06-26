@@ -37,11 +37,24 @@ DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(DAEMON_DIR), "config.yaml")
 
 # ── Config ────────────────────────────────────────────────────────
 
-class Config:
-    """Loads and indexes config.yaml. Owns the voice registry, the legacy
-    alias map, engine params, and the defaults — everything user-tunable."""
+def _safe_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
-    def __init__(self, path: str):
+
+class Config:
+    """Loads and indexes voices. Built-in voices + engine params + aliases come
+    from config.yaml (dev-owned, static); user-defined *custom* voices come from
+    a separate voices.json that relay's settings UI edits live. Owns the merged
+    voice registry, the legacy alias map, and the defaults.
+
+    The merged registry is held as a single dict snapshot in `self._reg` and
+    swapped atomically on reload, so the many client threads that call
+    `resolve()` / `public_voices()` never see a half-updated index — no lock."""
+
+    def __init__(self, path: str, custom_voices_path: str = None):
         self.path = path
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
@@ -57,43 +70,134 @@ class Config:
         self.default_instruct = raw.get(
             "default_instruct", "Warm, mature and composed.")
 
-        # Voice registry, in declared order (order is what list_voices returns).
-        self.voices = list(raw.get("voices", []))
-        self._by_id = {v["id"]: v for v in self.voices}
-        self._by_speaker = {v["speaker"]: v for v in self.voices}
+        # Built-in voices, in declared order, tagged kind="preset".
+        self._builtin = [dict(v, kind="preset") for v in raw.get("voices", [])]
         self.aliases = dict(raw.get("voice_aliases", {}))
+        # The model's built-in speakers — the only timbres a custom voice may
+        # name. Surfaced to relay's UI as the base_speaker select options.
+        self.speakers = [v["speaker"] for v in self._builtin]
 
-        if self.default_voice not in self._by_id:
+        # Custom voices live next to config.yaml by default. relay reads/writes
+        # this file directly and never creates it, so we seed an empty one.
+        self.custom_voices_path = custom_voices_path or os.path.join(
+            os.path.dirname(os.path.abspath(path)), "voices.json")
+        self._seed_custom_file()
+        self._reg = None
+        self.reload_custom()
+
+        if self.default_voice not in self._reg["by_id"]:
             raise ValueError(
                 f"default_voice {self.default_voice!r} is not a defined voice")
+
+    # ── Custom voice palette (relay-editable, hot-reloadable) ──────
+
+    def _seed_custom_file(self):
+        if os.path.exists(self.custom_voices_path):
+            return
+        try:
+            with open(self.custom_voices_path, "w") as f:
+                json.dump({"voices": []}, f, indent=2)
+            print(f"Seeded empty custom voices file: {self.custom_voices_path}")
+        except OSError as e:
+            print(f"Could not seed {self.custom_voices_path}: {e}")
+
+    def _normalize_custom(self, entry: dict, known_speakers: set) -> dict | None:
+        """Coerce one voices.json row into a render spec, or None if unusable.
+
+        Defensive: a bad hand-edit (or relay write) must never crash the daemon
+        — skip the offending row and keep serving the rest."""
+        try:
+            vid = str(entry.get("id", "")).strip()
+            speaker = str(entry.get("base_speaker") or entry.get("speaker") or "").strip()
+            if not vid:
+                return None
+            if speaker not in known_speakers:
+                print(f"custom voice {vid!r}: unknown base_speaker {speaker!r}; skipping")
+                return None
+            instruct = entry.get("instruct")
+            return {
+                "id": vid,
+                "name": str(entry.get("name") or vid),
+                "lang": str(entry.get("lang") or "English"),
+                "gender": str(entry.get("gender") or "F"),
+                "speaker": speaker,
+                "instruct": str(instruct).strip() if instruct else None,
+                "gain": _safe_float(entry.get("gain"), 1.0),
+                "speed": _safe_float(entry.get("speed"), 1.0),
+                "kind": "custom",
+            }
+        except Exception as e:
+            print(f"custom voice entry skipped ({e})")
+            return None
+
+    def _load_custom(self) -> list:
+        try:
+            with open(self.custom_voices_path) as f:
+                data = json.load(f) or {}
+        except FileNotFoundError:
+            return []
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"custom voices: cannot read {self.custom_voices_path}: {e}; ignoring")
+            return []
+        known = {v["speaker"] for v in self._builtin}
+        out = []
+        for entry in (data.get("voices") or []):
+            v = self._normalize_custom(entry, known) if isinstance(entry, dict) else None
+            if v:
+                out.append(v)
+        return out
+
+    def reload_custom(self) -> int:
+        """Rebuild the merged registry from built-ins + current voices.json.
+        Returns the count of custom voices loaded. Custom ids override built-ins."""
+        custom = self._load_custom()
+        merged, order = {}, []
+        for v in self._builtin + custom:
+            if v["id"] not in merged:
+                order.append(v["id"])
+            merged[v["id"]] = v  # custom (later) wins on id collision
+        voices = [merged[i] for i in order]
+        # by_speaker only maps built-in speakers (a raw speaker name resolves to
+        # its canonical preset voice, not to a custom restyle of it).
+        self._reg = {
+            "voices": voices,
+            "by_id": {v["id"]: v for v in voices},
+            "by_speaker": {v["speaker"]: v for v in voices if v["kind"] == "preset"},
+        }
+        return len(custom)
+
+    def voice_counts(self) -> dict:
+        voices = self._reg["voices"]
+        builtin = sum(1 for v in voices if v["kind"] == "preset")
+        return {"builtin": builtin, "custom": len(voices) - builtin, "total": len(voices)}
 
     def public_voices(self) -> list:
         """The kokoro-compatible {id,name,lang,gender} list for list_voices."""
         return [
             {"id": v["id"], "name": v["name"], "lang": v["lang"], "gender": v["gender"]}
-            for v in self.voices
+            for v in self._reg["voices"]
         ]
 
     def resolve(self, voice: str | None) -> dict:
-        """Map an incoming `voice` to a concrete {speaker, instruct} render spec.
+        """Map an incoming `voice` to a concrete render spec.
 
-        Accepts a relayTTS voice id, a legacy Kokoro id (via aliases), or a raw
-        Qwen3 speaker name. Anything unknown falls back to the default voice, so
-        old clients and stale preferences never error — the drop-in contract.
-        """
+        Accepts a relayTTS voice id (built-in or custom), a legacy Kokoro id (via
+        aliases), or a raw Qwen3 speaker name. Anything unknown falls back to the
+        default voice, so old clients and stale preferences never error — the
+        drop-in contract. A custom voice carries its own gain/speed defaults so
+        it sounds distinct even when the caller sends no overrides."""
+        reg = self._reg  # snapshot once: reload may swap it under us
         if not voice:
             voice = self.default_voice
-        # Legacy Kokoro id -> relayTTS id.
-        voice = self.aliases.get(voice, voice)
-        if voice in self._by_id:
-            v = self._by_id[voice]
-        elif voice in self._by_speaker:
-            v = self._by_speaker[voice]
-        else:
-            v = self._by_id[self.default_voice]
+        voice = self.aliases.get(voice, voice)  # legacy Kokoro id -> relayTTS id
+        v = (reg["by_id"].get(voice)
+             or reg["by_speaker"].get(voice)
+             or reg["by_id"][self.default_voice])
         return {
             "speaker": v["speaker"],
             "instruct": v.get("instruct") or self.default_instruct,
+            "gain": v.get("gain", 1.0),
+            "speed": v.get("speed", 1.0),
         }
 
 
@@ -164,6 +268,12 @@ class RelayTTSDaemon:
         self._ready = threading.Event()
         self._load_ok = False
         self._gen_thread = None
+        # Relay enhanced-service surface (status + voices.json editor). Set up
+        # in start() when relay spawned us; None in standalone mode.
+        self._bridge = None
+        self._start_time = None
+        self._last_rtf = None
+        self._voices_mtime = None
 
     def update_activity(self):
         with self.activity_lock:
@@ -249,12 +359,19 @@ class RelayTTSDaemon:
             raise job.error
         return job.result
 
-    def synthesize(self, text, voice=None, speed=1.0, lang_code=None, instruct=None, gain=1.0):
-        """Generate speech and return WAV bytes + metadata."""
+    def synthesize(self, text, voice=None, speed=None, lang_code=None, instruct=None, gain=None):
+        """Generate speech and return WAV bytes + metadata.
+
+        instruct/gain/speed precedence: explicit request value > the resolved
+        voice's own default > global default. Eve omits these when they're at
+        their defaults, so an omitted field lets a custom voice's configured
+        delivery (instruct + gain + speed) come through; an explicit value from
+        the Director still wins per-span."""
         spec = self.cfg.resolve(voice)
         speaker = spec["speaker"]
-        # A per-request instruct overrides the voice's configured default.
         instruct = instruct or spec["instruct"]
+        speed = spec["speed"] if speed is None else speed
+        gain = spec["gain"] if gain is None else gain
         lang_code = lang_code or self.cfg.lang_code
 
         t0 = time.time()
@@ -301,6 +418,7 @@ class RelayTTSDaemon:
         wav_bytes = buf.getvalue()
 
         rtf = generation_time / duration if duration > 0 else 0
+        self._last_rtf = round(rtf, 3)
         print(f"Generated: {duration:.2f}s audio in {generation_time:.2f}s "
               f"(RTF: {rtf:.2f}x) voice={voice or self.cfg.default_voice} speaker={speaker}")
 
@@ -375,13 +493,14 @@ class RelayTTSDaemon:
                                     {"success": True, "voices": self.cfg.public_voices()})
                 return
 
-            # Single request
+            # Single request. speed/instruct/gain default to None (not 1.0) so an
+            # omitted field uses the resolved voice's own default delivery.
             text = request.get("text", "")
             voice = request.get("voice")
-            speed = request.get("speed", 1.0)
+            speed = request.get("speed")
             lang_code = request.get("lang_code")
             instruct = request.get("instruct")
-            gain = request.get("gain", 1.0)
+            gain = request.get("gain")
 
             if not text:
                 self._send_response(client_socket, {"success": False, "error": "No text provided"})
@@ -415,10 +534,10 @@ class RelayTTSDaemon:
                 wav_bytes, timing = self.synthesize(
                     text=item.get("text", ""),
                     voice=item.get("voice"),
-                    speed=item.get("speed", 1.0),
+                    speed=item.get("speed"),
                     lang_code=item.get("lang_code"),
                     instruct=item.get("instruct"),
-                    gain=item.get("gain", 1.0),
+                    gain=item.get("gain"),
                 )
                 audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
                 chunk = {
@@ -447,10 +566,10 @@ class RelayTTSDaemon:
                 wav_bytes, timing = self.synthesize(
                     text=item.get("text", ""),
                     voice=item.get("voice"),
-                    speed=item.get("speed", 1.0),
+                    speed=item.get("speed"),
                     lang_code=item.get("lang_code"),
                     instruct=item.get("instruct"),
-                    gain=item.get("gain", 1.0),
+                    gain=item.get("gain"),
                 )
                 audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
                 results.append({"index": i, "success": True, "audio_base64": audio_b64, **timing})
@@ -470,12 +589,23 @@ class RelayTTSDaemon:
         # Load + warm the model on the dedicated generation thread, then wait
         # for it to be ready before we accept connections.
         self.running = True
+        self._start_time = time.time()
         self._gen_thread = threading.Thread(target=self._generation_worker, daemon=True)
         self._gen_thread.start()
         self._ready.wait()
         if not self._load_ok:
             self.running = False
             return False
+
+        # Enhanced-service surface for relay's settings UI (status + voices.json
+        # editor). Non-fatal: TTS on 9997 must work even if the inspector doesn't.
+        self._start_bridge()
+        # Watch voices.json so relay's live edits take effect without a restart.
+        try:
+            self._voices_mtime = os.path.getmtime(self.cfg.custom_voices_path)
+        except OSError:
+            self._voices_mtime = None
+        threading.Thread(target=self._voices_watch, daemon=True).start()
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -515,9 +645,73 @@ class RelayTTSDaemon:
     def stop(self):
         self.running = False
         self._jobs.put(None)  # wake the generation thread so it can exit
+        if self._bridge is not None:
+            try:
+                self._bridge.stop()
+            except Exception:
+                pass
         if self.sock:
             self.sock.close()
         print("Daemon stopped")
+
+    # ── Relay enhanced-service surface ────────────────────────────
+
+    def _start_bridge(self):
+        """Register the manifest with relay and serve /api/status, when relay
+        spawned us. Any failure here is logged and swallowed — the daemon still
+        serves Eve on 9997."""
+        try:
+            from relay_bridge import RelayBridge
+        except Exception as e:
+            print(f"relay bridge module unavailable ({e}); inspector disabled")
+            return
+        bridge = RelayBridge(
+            status_provider=self._status_payload,
+            config_path=self.cfg.custom_voices_path,
+            speakers=self.cfg.speakers,
+        )
+        if not bridge.enabled:
+            print("Standalone mode (no RELAY_BRIDGE_SOCKET); settings inspector disabled")
+            return
+        try:
+            bridge.start()
+            self._bridge = bridge
+            print("Registered manifest with relay — settings inspector enabled")
+        except Exception as e:
+            print(f"relay bridge registration failed (non-fatal): {e}")
+
+    def _status_payload(self) -> dict:
+        """Read-only snapshot relay polls for the inspector. Counters only —
+        must never touch the model (MLX is pinned to the generation thread)."""
+        uptime = round(time.time() - self._start_time, 1) if self._start_time else 0
+        return {
+            "service": "relaytts-daemon",
+            "model": self.cfg.repo_id,
+            "modelLoaded": self._load_ok,
+            "port": self.port,
+            "sampleRate": self.cfg.sample_rate,
+            "defaultVoice": self.cfg.default_voice,
+            "voices": self.cfg.voice_counts(),
+            "uptimeSeconds": uptime,
+            "lastRtf": self._last_rtf,
+        }
+
+    def _voices_watch(self):
+        """Hot-reload voices.json on change (applyMode=live: relay edits the file
+        but does not restart us). Reloading swaps the registry; no model reload."""
+        while self.running:
+            try:
+                mtime = os.path.getmtime(self.cfg.custom_voices_path)
+            except OSError:
+                mtime = None
+            if mtime is not None and mtime != self._voices_mtime:
+                self._voices_mtime = mtime
+                try:
+                    n = self.cfg.reload_custom()
+                    print(f"Reloaded custom voices ({n}) from {self.cfg.custom_voices_path}")
+                except Exception as e:
+                    print(f"custom voices reload failed: {e}")
+            time.sleep(1.5)
 
 
 def main():
@@ -526,12 +720,17 @@ def main():
     parser.add_argument("--port", type=int, default=9997)
     parser.add_argument("--config", default=os.environ.get("RELAYTTS_CONFIG", DEFAULT_CONFIG_PATH),
                         help="Path to config.yaml (voices + instruct + engine params)")
+    parser.add_argument("--custom-voices", default=os.environ.get("RELAYTTS_VOICES"),
+                        help="Path to the relay-editable custom voices JSON "
+                             "(default: voices.json beside config.yaml)")
     parser.add_argument("--idle-timeout", type=int, default=0,
                         help="Auto-shutdown after idle seconds (0 = disabled)")
     args = parser.parse_args()
 
-    config = Config(args.config)
-    print(f"Loaded config: {args.config} ({len(config.voices)} voices, default={config.default_voice})")
+    config = Config(args.config, custom_voices_path=args.custom_voices)
+    counts = config.voice_counts()
+    print(f"Loaded config: {args.config} ({counts['builtin']} built-in + "
+          f"{counts['custom']} custom voices, default={config.default_voice})")
     daemon = RelayTTSDaemon(config, host=args.host, port=args.port, idle_timeout=args.idle_timeout)
     daemon.start()
 

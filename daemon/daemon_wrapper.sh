@@ -8,6 +8,11 @@ source "${CONDA_BASE}/bin/activate" relaytts
 # Directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Line-buffer the daemon's stdout/stderr so operational logs (model load, bridge
+# registration, custom-voice reloads) reach Relay's logfile promptly instead of
+# sitting in a block buffer while the long-lived process runs.
+export PYTHONUNBUFFERED=1
+
 # Restart-on-crash supervision.
 #
 # The daemon wraps non-thread-safe native libs (MLX/Metal), which it drives from

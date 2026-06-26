@@ -8,3 +8,7 @@ venv/
 
 # Session scratch / resume notes (not part of the project)
 SUMMARY.md
+
+# User-defined custom voices — runtime state, seeded empty by the daemon and
+# edited via Relay's settings inspector. Not source.
+voices.json
