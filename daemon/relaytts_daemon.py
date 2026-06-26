@@ -249,7 +249,7 @@ class RelayTTSDaemon:
             raise job.error
         return job.result
 
-    def synthesize(self, text, voice=None, speed=1.0, lang_code=None, instruct=None):
+    def synthesize(self, text, voice=None, speed=1.0, lang_code=None, instruct=None, gain=1.0):
         """Generate speech and return WAV bytes + metadata."""
         spec = self.cfg.resolve(voice)
         speaker = spec["speaker"]
@@ -286,6 +286,12 @@ class RelayTTSDaemon:
         # time-stretch instead.
         if speed and abs(speed - 1.0) >= 1e-3:
             audio = time_stretch(audio, self.cfg.sample_rate, speed)
+
+        # Amplitude gain makes delivery audible (loud/whisper): instruct= alone
+        # barely changes loudness, so the Director sends a gain too. Clip to
+        # avoid overflow when boosting.
+        if gain and abs(gain - 1.0) >= 1e-3:
+            audio = np.clip(audio * gain, -1.0, 1.0)
 
         generation_time = time.time() - t0
         duration = len(audio) / self.cfg.sample_rate
@@ -375,12 +381,13 @@ class RelayTTSDaemon:
             speed = request.get("speed", 1.0)
             lang_code = request.get("lang_code")
             instruct = request.get("instruct")
+            gain = request.get("gain", 1.0)
 
             if not text:
                 self._send_response(client_socket, {"success": False, "error": "No text provided"})
                 return
 
-            wav_bytes, timing = self.synthesize(text, voice, speed, lang_code, instruct)
+            wav_bytes, timing = self.synthesize(text, voice, speed, lang_code, instruct, gain)
             audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
 
             self._send_response(client_socket, {
@@ -411,6 +418,7 @@ class RelayTTSDaemon:
                     speed=item.get("speed", 1.0),
                     lang_code=item.get("lang_code"),
                     instruct=item.get("instruct"),
+                    gain=item.get("gain", 1.0),
                 )
                 audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
                 chunk = {
@@ -442,6 +450,7 @@ class RelayTTSDaemon:
                     speed=item.get("speed", 1.0),
                     lang_code=item.get("lang_code"),
                     instruct=item.get("instruct"),
+                    gain=item.get("gain", 1.0),
                 )
                 audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
                 results.append({"index": i, "success": True, "audio_base64": audio_b64, **timing})
