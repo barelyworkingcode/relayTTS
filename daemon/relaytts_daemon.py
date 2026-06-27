@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import warnings
+from collections import Counter
 
 warnings.filterwarnings("ignore")
 
@@ -144,8 +145,7 @@ class Config:
         try:
             vid = str(entry.get("id", "")).strip()
             ref_audio = str(entry.get("ref_audio") or "").strip()
-            ref_text = entry.get("ref_text")
-            ref_text = str(ref_text).strip() if ref_text else ""
+            ref_text = str(entry.get("ref_text") or "").strip()
             if not vid:
                 return None
             if not ref_audio or not ref_text:
@@ -204,13 +204,13 @@ class Config:
         return len(custom) + len(clones)
 
     def voice_counts(self) -> dict:
-        c = {"builtin": 0, "custom": 0, "clone": 0}
-        for v in self._reg["voices"]:
-            key = {"preset": "builtin", "custom": "custom", "clone": "clone"}.get(
-                v["kind"], "builtin")
-            c[key] += 1
-        c["total"] = len(self._reg["voices"])
-        return c
+        counts = Counter(v["kind"] for v in self._reg["voices"])
+        return {
+            "builtin": counts["preset"],
+            "custom": counts["custom"],
+            "clone": counts["clone"],
+            "total": len(self._reg["voices"]),
+        }
 
     def public_voices(self) -> list:
         """The kokoro-compatible {id,name,lang,gender} list for list_voices."""
@@ -451,38 +451,28 @@ class RelayTTSDaemon:
                     f"clone voice {voice!r}: ref_audio not found: {ref_audio!r}")
             if not ref_text:
                 raise RuntimeError(f"clone voice {voice!r}: ref_text is required")
-
-            def _generate():
-                model = self._ensure_clone_model()
-                segs = []
-                for result in model.generate(
-                    text=text,
-                    ref_audio=ref_audio,
-                    ref_text=ref_text,
-                    lang_code=lang_code,
-                    temperature=self.cfg.temperature,
-                ):
-                    segs.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
-                return segs
-
+            gen_kwargs = {"ref_audio": ref_audio, "ref_text": ref_text}
             descr = f"clone:{os.path.basename(ref_audio)}"
         else:
             speaker = spec["speaker"]
             instruct = instruct or spec["instruct"]
-
-            def _generate():
-                segs = []
-                for result in self.model.generate(
-                    text=text,
-                    voice=speaker,
-                    instruct=instruct,
-                    lang_code=lang_code,
-                    temperature=self.cfg.temperature,
-                ):
-                    segs.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
-                return segs
-
+            gen_kwargs = {"voice": speaker, "instruct": instruct}
             descr = f"speaker={speaker}"
+
+        def _generate():
+            # Clone uses the Base model, loaded lazily here on the generation
+            # thread (MLX must load on the thread that drives it); presets use
+            # the already-loaded primary model.
+            model = self._ensure_clone_model() if spec["kind"] == "clone" else self.model
+            segs = []
+            for result in model.generate(
+                text=text,
+                lang_code=lang_code,
+                temperature=self.cfg.temperature,
+                **gen_kwargs,
+            ):
+                segs.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
+            return segs
 
         segments = self._run_on_worker(_generate)
 
