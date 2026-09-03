@@ -85,8 +85,10 @@ Sending them would double-apply.
 - Clone voices ship `ref_audio` as base64 with the request, because the
   reference recording lives beside the daemon and the server cannot see that
   path. Servers cap this (~60s of audio).
-- `RELAYTTS_REMOTE_URL` overrides `base_url` **and** enables remote on its own,
-  so a supervisor can flip one deployment without editing tracked config.
+- `RELAYTTS_REMOTE_URL` overrides `base_url` **and** enables remote on its own;
+  `RELAYTTS_REMOTE_MODEL` / `RELAYTTS_REMOTE_CLONE_MODEL` supply the ids. All
+  three are deployment facts, so `config.yaml` ships them empty and a
+  deployment never edits tracked config.
 - A bad endpoint surfaces per-request, not at startup: the daemon still comes
   up and still serves `list_voices` if the remote host is booting behind it.
 
@@ -122,8 +124,9 @@ Remote deployment is the same two commands, one flag and one variable — nothin
 in the source changes:
 
 ```bash
-./setup_env.sh --remote                                  # no MLX, no weights
-RELAYTTS_REMOTE_URL=http://<router>:<port>/v1 ./build.sh # baked into the registration
+./setup_env.sh --remote                              # no MLX, no weights
+RELAYTTS_REMOTE_URL=http://<router>:<port>/v1 \\
+RELAYTTS_REMOTE_MODEL=<id-that-server-exposes> ./build.sh
 ```
 
 `--remote` installs `requirements-remote.txt` (soundfile, numpy, pyyaml) instead

@@ -122,7 +122,8 @@ Set it up with the dependency set that matches — `--remote` skips MLX entirely
 
 ```bash
 ./setup_env.sh --remote
-RELAYTTS_REMOTE_URL=http://<router>:<port>/v1 ./build.sh
+RELAYTTS_REMOTE_URL=http://<router>:<port>/v1 \\
+RELAYTTS_REMOTE_MODEL=<id-that-server-exposes> ./build.sh
 ```
 
 `RELAYTTS_REMOTE_URL` sets `base_url` and enables remote mode on its own, and `build.sh` bakes it into the service registration — so a host's address never has to enter the config file.

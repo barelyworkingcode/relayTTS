@@ -24,11 +24,18 @@ if [ -x "$RELAY" ]; then
     # RELAYTTS_REMOTE_URL before running this and it is baked into the service
     # registration, so the daemon comes up in remote mode and loads no model.
     #
-    #   RELAYTTS_REMOTE_URL=http://<host>:8080/v1 ./build.sh
+    #   RELAYTTS_REMOTE_URL=http://<router>:<port>/v1 \\
+    #   RELAYTTS_REMOTE_MODEL=<id-that-server-exposes> ./build.sh
     #
     REGISTER_ENV=()
     if [ -n "${RELAYTTS_REMOTE_URL:-}" ]; then
         REGISTER_ENV+=(--env "RELAYTTS_REMOTE_URL=$RELAYTTS_REMOTE_URL")
+    fi
+    if [ -n "${RELAYTTS_REMOTE_MODEL:-}" ]; then
+        REGISTER_ENV+=(--env "RELAYTTS_REMOTE_MODEL=$RELAYTTS_REMOTE_MODEL")
+    fi
+    if [ -n "${RELAYTTS_REMOTE_CLONE_MODEL:-}" ]; then
+        REGISTER_ENV+=(--env "RELAYTTS_REMOTE_CLONE_MODEL=$RELAYTTS_REMOTE_CLONE_MODEL")
     fi
 
     if "$RELAY" service list 2>/dev/null | grep -q "relaytts-daemon"; then

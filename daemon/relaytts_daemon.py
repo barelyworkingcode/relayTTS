@@ -327,10 +327,15 @@ class RemoteEngine:
         env_url = os.environ.get("RELAYTTS_REMOTE_URL")
         self.base_url = (env_url or raw.get("base_url") or "").rstrip("/")
         self.enabled = bool(self.base_url) and bool(env_url or raw.get("enabled"))
-        self.model = raw.get("model") or ""
+        # Model ids come from the environment first, for the same reason the URL
+        # does: they are deployment facts, and a remote id is meaningless
+        # without the endpoint that serves it. Config them together or not at
+        # all — otherwise the tracked config has to carry one half.
+        self.model = os.environ.get("RELAYTTS_REMOTE_MODEL") or raw.get("model") or ""
         # Cloning renders through a different checkpoint (the Base model), the
         # same split the local path makes between repo_id and clone_repo_id.
-        self.clone_model = raw.get("clone_model") or self.model
+        self.clone_model = (os.environ.get("RELAYTTS_REMOTE_CLONE_MODEL")
+                            or raw.get("clone_model") or self.model)
         self.timeout = _safe_float(raw.get("timeout"), 120.0)
         # Read from the environment, never from the config file, so the token
         # is not committed. Unset is normal when a router holds the credential.
@@ -339,8 +344,8 @@ class RemoteEngine:
 
         if self.enabled and not self.model:
             raise ValueError(
-                "engine.remote is enabled but engine.remote.model is unset — "
-                "set it to the model id the remote server exposes")
+                "remote mode needs a model id: set RELAYTTS_REMOTE_MODEL or "
+                "engine.remote.model to the id the remote server exposes")
 
     @property
     def speech_url(self) -> str:

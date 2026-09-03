@@ -446,6 +446,34 @@ def test_remote_undecodable_body_is_reported(tmp_path, monkeypatch):
         cfg.remote.synthesize(cfg.resolve("ryan"), "Hi.", "english", None, 0.9, 24000)
 
 
+def test_remote_model_from_env(tmp_path, monkeypatch):
+    """The model id is a deployment fact like the URL. Without an env var for
+    it, the documented one-liner deploy could not work at all — the tracked
+    config would have to carry half the endpoint."""
+    monkeypatch.setenv("RELAYTTS_REMOTE_URL", "http://198.51.100.10:8080/v1")
+    monkeypatch.setenv("RELAYTTS_REMOTE_MODEL", "router/customvoice")
+    cfg = _make_config(str(tmp_path))  # config.yaml carries no remote block
+    assert cfg.remote.enabled is True
+    assert cfg.remote.model == "router/customvoice"
+    # Clone falls back to the same id rather than erroring, so a deployment
+    # that never clones does not have to configure a second model.
+    assert cfg.remote.clone_model == "router/customvoice"
+
+
+def test_remote_clone_model_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("RELAYTTS_REMOTE_URL", "http://198.51.100.10:8080/v1")
+    monkeypatch.setenv("RELAYTTS_REMOTE_MODEL", "router/customvoice")
+    monkeypatch.setenv("RELAYTTS_REMOTE_CLONE_MODEL", "router/base")
+    cfg = _make_config(str(tmp_path))
+    assert cfg.remote.clone_model == "router/base"
+
+
+def test_remote_env_model_overrides_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("RELAYTTS_REMOTE_MODEL", "env/wins")
+    cfg = _make_config(str(tmp_path), remote=REMOTE_BLOCK)
+    assert cfg.remote.model == "env/wins"
+
+
 if __name__ == "__main__":
     # pytest is not in requirements.txt, so this file stays runnable without it.
     # With pytest present, defer to it — the fixture-based tests below only run
