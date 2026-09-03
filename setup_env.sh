@@ -15,11 +15,44 @@
 #
 # If requirements.txt does not yet exist (fresh clone before first lock), deps
 # are installed loose from requirements.in directly.
+#
+# Usage:
+#   ./setup_env.sh              # local engine: the daemon loads the model itself
+#   ./setup_env.sh --remote     # remote engine: no MLX, no weights, ~2 GB lighter
+#
+# --remote installs requirements-remote.txt instead: soundfile, numpy and pyyaml,
+# and nothing else. It deliberately omits mlx-audio and mlx, because a remote
+# daemon never loads a model — and a box that *could* load one can silently fall
+# back to doing so, which is the memory pressure remote mode exists to avoid.
+# HTTP is urllib from the standard library, so there is no client dep either.
+#
+# Both modes build the same env name, since daemon_wrapper.sh activates it by
+# name; switching modes means rebuilding the env.
 set -euo pipefail
 
 ENV_NAME="relaytts"
 CONDA_BASE="$(conda info --base)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+REMOTE=0
+for arg in "$@"; do
+    case "$arg" in
+        --remote) REMOTE=1 ;;
+        -h|--help) sed -n '2,30p' "$0"; exit 0 ;;
+        *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
+    esac
+done
+
+if [ "$REMOTE" -eq 1 ]; then
+    REQ_IN="requirements-remote.in"
+    REQ_TXT="requirements-remote.txt"
+    MODE_DESC="remote engine (no MLX)"
+else
+    REQ_IN="requirements.in"
+    REQ_TXT="requirements.txt"
+    MODE_DESC="local engine (MLX + Qwen3-TTS)"
+fi
+echo "Setting up '${ENV_NAME}' for the ${MODE_DESC}."
 
 # NOTE: espeak-ng / misaki / phonemizer are intentionally NOT installed here.
 # Qwen3-TTS has no G2P phonemizer step — it speaks directly from text.
@@ -34,19 +67,27 @@ fi
 
 source "${CONDA_BASE}/bin/activate" "$ENV_NAME"
 
-if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
-    echo "Installing pinned, hash-verified runtime dependencies..."
-    pip install --require-hashes -r "$SCRIPT_DIR/requirements.txt"
+if [ -f "$SCRIPT_DIR/$REQ_TXT" ]; then
+    echo "Installing pinned, hash-verified runtime dependencies from $REQ_TXT..."
+    pip install --require-hashes -r "$SCRIPT_DIR/$REQ_TXT"
 else
-    echo "requirements.txt not found — installing loose deps from requirements.in..."
-    echo "(Generate a pinned lockfile later with: pip-compile --generate-hashes --allow-unsafe --output-file requirements.txt requirements.in)"
-    pip install -r "$SCRIPT_DIR/requirements.in"
+    echo "$REQ_TXT not found — installing loose deps from $REQ_IN..."
+    echo "(Generate a pinned lockfile later with: pip-compile --generate-hashes --allow-unsafe --output-file $REQ_TXT $REQ_IN)"
+    pip install -r "$SCRIPT_DIR/$REQ_IN"
 fi
 
 # Dev tooling for maintaining the lockfile (not part of the runtime surface, so
-# intentionally not in the hash-pinned lock).
-pip install pip-tools pip-audit
+# intentionally not in the hash-pinned lock). A remote box is a deployment, not
+# a place lockfiles get regenerated, so it does not get these.
+if [ "$REMOTE" -eq 0 ]; then
+    pip install pip-tools pip-audit
+fi
 
 echo ""
-echo "Environment '${ENV_NAME}' is ready."
+echo "Environment '${ENV_NAME}' is ready — ${MODE_DESC}."
 echo "Activate with: conda activate ${ENV_NAME}"
+if [ "$REMOTE" -eq 1 ]; then
+    echo ""
+    echo "Remote mode still needs a URL. Register the service with one:"
+    echo "  RELAYTTS_REMOTE_URL=http://<router>:<port>/v1 ./build.sh"
+fi

@@ -21,6 +21,41 @@ engine:
   # fidelity for RAM (0.6B is lighter, bf16 is heavier/higher quality).
   clone_repo_id: mlx-community/Qwen3-TTS-12Hz-1.7B-Base-6bit
 
+  # Remote inference. Off by default: the daemon loads the models above and
+  # stands alone. Turn it on and the daemon loads NOTHING — no MLX, no weights,
+  # no generation thread — and every synthesis becomes an OpenAI-compatible
+  # POST to base_url/audio/speech instead. Everything else is unchanged: the
+  # voice registry, the instruct/speed/gain precedence, the time-stretch, and
+  # the TCP protocol on 9997 are all identical, so clients cannot tell.
+  #
+  # This is for running the daemon on a machine too small to hold the weights
+  # (a VM) while a host with the GPU does the work. If an LLM router fronts
+  # that server, prefer pointing base_url at the router: it can hold the
+  # upstream credential, so no token has to live beside the daemon, and it is
+  # often the only address already reachable from the VM.
+  #
+  # Left blank on purpose: these are deployment facts, not source. Set them per
+  # machine via RELAYTTS_REMOTE_URL, which overrides base_url AND enables remote
+  # on its own — so a deployment never has to edit this tracked file, and no
+  # host's addresses end up in version control.
+  #
+  # `model` is the id the REMOTE server exposes, which need not match repo_id
+  # above; a router may prefix or alias its upstreams. For example:
+  #
+  #   base_url: http://198.51.100.10:8080/v1
+  #   model: my-router/qwen3-tts-customvoice
+  #   clone_model: my-router/qwen3-tts-base
+  #
+  remote:
+    enabled: false
+    base_url: ""
+    model: ""
+    clone_model: ""
+    timeout: 120
+    # Name of the env var holding a bearer token, if the endpoint needs one.
+    # The token itself is never written here.
+    api_key_env: RELAYTTS_REMOTE_API_KEY
+
 # Voice used when a request omits `voice` or sends an unknown id.
 default_voice: anna
 
