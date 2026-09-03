@@ -13,6 +13,13 @@
 #
 #   pip-compile --generate-hashes --allow-unsafe --output-file requirements-remote.txt requirements-remote.in
 #
+# COMPILE THIS WITH PYTHON 3.11 — the version setup_env.sh builds the env with.
+# pip-compile resolves against the interpreter running it, so compiling on a
+# newer Python silently pins wheels that 3.11 cannot install, and the failure
+# only shows up on a fresh deployment:
+#
+#   ERROR: Could not find a version that satisfies the requirement numpy==2.5.2
+#
 # ffmpeg (brew install ffmpeg) is still required at runtime: `speed` is honored
 # with a pitch-preserving time-stretch locally, on both engines.
 
