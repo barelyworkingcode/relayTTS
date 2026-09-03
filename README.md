@@ -25,6 +25,8 @@ Eve Web Chat ──WS──► Eve Backend ──TCP──► relayTTS Daemon (p
 
 The daemon runs as a Relay autostart service. Eve connects via TCP, sends text + voice ID, receives base64-encoded WAV audio.
 
+Optionally the daemon holds no model at all and calls out to a server that does — see [Remote inference](#remote-inference).
+
 Qwen3-TTS is an instruction-driven model: each voice has an `instruct` field in `config.yaml` that shapes its emotion and delivery style (e.g. "Confident, clear and friendly."). The daemon injects the instruct when generating — no phonemizer or G2P step required.
 
 ## Voices
@@ -99,6 +101,39 @@ TCP on port 9997. Length-prefixed JSON (4-byte big-endian header). Identical to 
 
 **Other actions:** `{ "action": "list_voices" }` returns the kokoro-shaped `{id, name, lang, gender}` list. `{ "batch": [ {item}, ... ] }` synthesizes many at once; add `"stream": true` for newline-delimited per-item chunks ending in a `{"type":"complete"}` line.
 
+## Remote inference
+
+By default the daemon owns its model. Set `engine.remote.enabled: true` in `config.yaml` and it loads **nothing** — no MLX, no weights, no generation thread — and synthesizes by calling an OpenAI-compatible `POST {base_url}/audio/speech` instead. Measured footprint: **53 MB** resident, against 2.8 GB with the model loaded.
+
+This is for running the daemon on a machine too small to hold the weights — a VM, a spare box — while something with a GPU does the work. Nothing else changes: the voice registry, the `instruct`/`speed`/`gain` precedence, the pitch-preserving time-stretch and the TCP protocol on 9997 are all identical, so clients cannot tell which engine is serving them.
+
+```yaml
+engine:
+  remote:
+    enabled: true
+    base_url: http://198.51.100.10:8080/v1          # your server, or a router in front of it
+    model: my-router/qwen3-tts-customvoice
+    clone_model: my-router/qwen3-tts-base
+    timeout: 120
+    api_key_env: RELAYTTS_REMOTE_API_KEY   # name of the env var, never the token
+```
+
+Set it up with the dependency set that matches — `--remote` skips MLX entirely, roughly 2 GB lighter, and leaves the box unable to quietly fall back to loading a model:
+
+```bash
+./setup_env.sh --remote
+RELAYTTS_REMOTE_URL=http://<router>:<port>/v1 ./build.sh
+```
+
+`RELAYTTS_REMOTE_URL` sets `base_url` and enables remote mode on its own, and `build.sh` bakes it into the service registration — so a host's address never has to enter the config file.
+
+Notes:
+
+- `model` is the id the **remote** server exposes, which is not `engine.repo_id`. A router may prefix its upstreams.
+- If that server sits behind an LLM router you already run, point `base_url` at the router rather than the server: it can hold the upstream credential so no token has to live beside the daemon.
+- Clone voices send `ref_audio` as base64 with each request — the reference recording lives beside the daemon, not on the server. Servers cap this at roughly 60 seconds of audio.
+- A bad endpoint surfaces per request, not at startup, so the daemon still comes up and still answers `list_voices` if the remote host is still booting.
+
 ## Files
 
 ```
@@ -110,11 +145,13 @@ relayTTS/
 ├── setup_env.sh               # Creates conda env (relaytts, python 3.11) + installs deps
 ├── requirements.in            # Top-level deps (intent); edit to change a dep
 ├── requirements.txt           # Hash-pinned lockfile (generate with pip-compile; do not hand-edit)
+├── requirements-remote.in     # Same, for --remote: no MLX, no weights
+├── requirements-remote.txt    # Hash-pinned lockfile for --remote
 ├── config.yaml                # Built-in voices, instruct strings, voice_aliases, engine params
 ├── voices.json                # Runtime custom voices + clones (gitignored, seeded empty)
 ├── test_speak.sh              # CLI test tool
 └── daemon/
-    ├── relaytts_daemon.py     # TCP server, MLX/Qwen3-TTS model, WAV generation
+    ├── relaytts_daemon.py     # TCP server, MLX/Qwen3-TTS model or remote engine, WAV generation
     ├── relay_bridge.py        # Relay settings-UI bridge (status + voices.json editor)
     ├── daemon_wrapper.sh      # Conda wrapper + restart-on-crash supervisor
     └── test_relaytts.py       # pytest suite (incl. concurrency smoke test)

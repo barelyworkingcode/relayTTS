@@ -23,6 +23,8 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import warnings
 from collections import Counter
 
@@ -70,6 +72,9 @@ class Config:
         # model from the CustomVoice one above; loaded lazily on first clone use.
         self.clone_repo_id = engine.get(
             "clone_repo_id", "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-6bit")
+        # Remote inference. Disabled by default: the daemon owns its model and
+        # stands alone. Enabled, repo_id/clone_repo_id above go unused.
+        self.remote = RemoteEngine(engine.get("remote"))
 
         self.default_voice = raw.get("default_voice", "anna")
         self.default_instruct = raw.get(
@@ -277,6 +282,143 @@ def time_stretch(audio: np.ndarray, sr: int, speed: float) -> np.ndarray:
     return out.mean(axis=1) if out.ndim > 1 else out
 
 
+def resample(audio: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
+    """Resample to `target_sr`. Only used on the remote path, where the server
+    is free to answer at a rate other than the one config.yaml declares — every
+    client of this daemon is told `sample_rate`, so the audio has to match it."""
+    if sr == target_sr or audio.size == 0:
+        return audio
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            f"remote engine returned {sr} Hz but config declares {target_sr} Hz, "
+            "and ffmpeg is not installed to resample")
+
+    with tempfile.TemporaryDirectory() as d:
+        src, dst = os.path.join(d, "in.wav"), os.path.join(d, "out.wav")
+        sf.write(src, audio, sr, subtype="PCM_16")
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+                        "-ar", str(target_sr), dst], check=True)
+        out, _ = sf.read(dst, dtype="float32")
+    return out.mean(axis=1) if out.ndim > 1 else out
+
+
+# ── Remote engine ─────────────────────────────────────────────────
+
+class RemoteEngine:
+    """Synthesis over HTTP against an OpenAI-compatible /v1/audio/speech server.
+
+    When enabled the daemon loads no model at all — no MLX, no weights, no
+    generation thread. It keeps everything else: the voice registry, the
+    instruct/speed/gain precedence, the time-stretch, and the byte-identical TCP
+    protocol on 9997. Only the model call moves. That lets the daemon run
+    somewhere too small to hold the weights (a VM) while a host with the GPU
+    does the inference, with no change on the client side.
+
+    If a router fronts the inference server, point `base_url` at the router
+    rather than the server: it can hold the upstream credential, so no secret
+    has to live beside the daemon. `api_key_env` is there for the case where you
+    do talk to a server that authenticates.
+    """
+
+    def __init__(self, raw: dict):
+        raw = raw or {}
+        # An env-supplied URL enables remote mode on its own, so relay can flip
+        # a service to remote by setting one variable instead of editing config.
+        env_url = os.environ.get("RELAYTTS_REMOTE_URL")
+        self.base_url = (env_url or raw.get("base_url") or "").rstrip("/")
+        self.enabled = bool(self.base_url) and bool(env_url or raw.get("enabled"))
+        self.model = raw.get("model") or ""
+        # Cloning renders through a different checkpoint (the Base model), the
+        # same split the local path makes between repo_id and clone_repo_id.
+        self.clone_model = raw.get("clone_model") or self.model
+        self.timeout = _safe_float(raw.get("timeout"), 120.0)
+        # Read from the environment, never from the config file, so the token
+        # is not committed. Unset is normal when a router holds the credential.
+        self.api_key = os.environ.get(
+            raw.get("api_key_env") or "RELAYTTS_REMOTE_API_KEY") or None
+
+        if self.enabled and not self.model:
+            raise ValueError(
+                "engine.remote is enabled but engine.remote.model is unset — "
+                "set it to the model id the remote server exposes")
+
+    @property
+    def speech_url(self) -> str:
+        return f"{self.base_url}/audio/speech"
+
+    @property
+    def label(self) -> str:
+        """Endpoint identity for logs and errors — never includes the token."""
+        return self.base_url or "<unset>"
+
+    @staticmethod
+    def _error_detail(body: bytes) -> str:
+        """Pull a human message out of an error body, whatever shape it is."""
+        text = (body or b"")[:400].decode("utf-8", "replace").strip()
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            return text
+        if isinstance(parsed, dict):
+            err = parsed.get("error")
+            if isinstance(err, dict):
+                return str(err.get("message") or err)
+            if err:
+                return str(err)
+        return text
+
+    def synthesize(self, spec: dict, text: str, lang_code: str,
+                   instruct: str | None, temperature: float,
+                   sample_rate: int) -> np.ndarray:
+        """Render one span remotely and return float32 mono at `sample_rate`.
+
+        `speed` and `gain` are deliberately NOT sent: Qwen3's native speed= is a
+        no-op and the server has no gain at all, so both stay local exactly as
+        on the local path. A remote daemon therefore renders a given request
+        identically to a local one."""
+        if spec["kind"] == "clone":
+            ref_audio, ref_text = spec.get("ref_audio"), spec.get("ref_text")
+            with open(ref_audio, "rb") as f:
+                ref_b64 = base64.b64encode(f.read()).decode("ascii")
+            payload = {"model": self.clone_model, "ref_audio": ref_b64,
+                       "ref_text": ref_text}
+        else:
+            payload = {"model": self.model, "voice": spec["speaker"]}
+            if instruct:
+                payload["instructions"] = instruct
+
+        payload.update({"input": text, "response_format": "wav",
+                        "language": lang_code, "temperature": temperature})
+
+        req = urllib.request.Request(
+            self.speech_url, data=json.dumps(payload).encode("utf-8"),
+            method="POST", headers={"Content-Type": "application/json"})
+        if self.api_key:
+            req.add_header("Authorization", f"Bearer {self.api_key}")
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                wav = resp.read()
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(
+                f"remote TTS {self.label} returned HTTP {e.code}: "
+                f"{self._error_detail(e.read())}") from None
+        except urllib.error.URLError as e:
+            raise RuntimeError(
+                f"remote TTS {self.label} unreachable: {e.reason}") from None
+
+        try:
+            audio, sr = sf.read(io.BytesIO(wav), dtype="float32")
+        except Exception as e:
+            raise RuntimeError(
+                f"remote TTS {self.label} returned {len(wav)} bytes that are "
+                f"not decodable audio: {e}") from None
+
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+        return resample(audio, sr, sample_rate)
+
+
 # ── Daemon ────────────────────────────────────────────────────────
 
 class _Job:
@@ -294,6 +436,7 @@ class _Job:
 class RelayTTSDaemon:
     def __init__(self, config: Config, host="localhost", port=9997, idle_timeout=0):
         self.cfg = config
+        self.remote = config.remote
         self.host = host
         self.port = port
         self.model = None
@@ -437,11 +580,8 @@ class RelayTTSDaemon:
 
         t0 = time.time()
 
-        # Build the generation closure. It runs on the dedicated generation thread
-        # (np.asarray() forces MLX's lazy eval, so the Metal compute happens inside
-        # the closure, on that thread). WAV encoding/base64 below operate on local
-        # data and stay on the client thread, so overlapping requests can finish
-        # encoding in parallel.
+        # Resolve what to render. Both paths share this: the remote engine is
+        # handed the same spec the local closure would have used.
         if spec["kind"] == "clone":
             # Cloning uses the Base model with reference audio + transcript; the
             # speaker comes from the recording, so voice/instruct don't apply.
@@ -459,27 +599,42 @@ class RelayTTSDaemon:
             gen_kwargs = {"voice": speaker, "instruct": instruct}
             descr = f"speaker={speaker}"
 
-        def _generate():
-            # Clone uses the Base model, loaded lazily here on the generation
-            # thread (MLX must load on the thread that drives it); presets use
-            # the already-loaded primary model.
-            model = self._ensure_clone_model() if spec["kind"] == "clone" else self.model
-            segs = []
-            for result in model.generate(
-                text=text,
-                lang_code=lang_code,
-                temperature=self.cfg.temperature,
-                **gen_kwargs,
-            ):
-                segs.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
-            return segs
+        # Remote mode moves the model call and nothing else: the spec, the
+        # instruct precedence above and the speed/gain below are identical on
+        # both paths, so a remote daemon renders a request the same way a
+        # local one does.
+        if self.remote.enabled:
+            audio = self.remote.synthesize(
+                spec, text, lang_code, instruct, self.cfg.temperature,
+                self.cfg.sample_rate)
+        else:
+            # The closure runs on the dedicated generation thread (np.asarray()
+            # forces MLX's lazy eval, so the Metal compute happens inside it, on
+            # that thread). WAV encoding/base64 further down operates on local
+            # data and stays on the client thread, so overlapping requests can
+            # finish encoding in parallel.
+            def _generate():
+                # Clone uses the Base model, loaded lazily here on the generation
+                # thread (MLX must load on the thread that drives it); presets use
+                # the already-loaded primary model.
+                model = self._ensure_clone_model() if spec["kind"] == "clone" else self.model
+                segs = []
+                for result in model.generate(
+                    text=text,
+                    lang_code=lang_code,
+                    temperature=self.cfg.temperature,
+                    **gen_kwargs,
+                ):
+                    segs.append(np.asarray(result.audio, dtype=np.float32).reshape(-1))
+                return segs
 
-        segments = self._run_on_worker(_generate)
+            segments = self._run_on_worker(_generate)
 
-        if not segments:
-            raise RuntimeError("No audio generated")
+            if not segments:
+                raise RuntimeError("No audio generated")
 
-        audio = np.concatenate(segments)
+            audio = np.concatenate(segments)
+
         # Qwen3's native speed= is a no-op; honor `speed` with a pitch-preserving
         # time-stretch instead.
         if speed and abs(speed - 1.0) >= 1e-3:
@@ -667,16 +822,26 @@ class RelayTTSDaemon:
     # ── Server lifecycle ──────────────────────────────────────────
 
     def start(self):
-        # Load + warm the model on the dedicated generation thread, then wait
-        # for it to be ready before we accept connections.
         self.running = True
         self._start_time = time.time()
-        self._gen_thread = threading.Thread(target=self._generation_worker, daemon=True)
-        self._gen_thread.start()
-        self._ready.wait()
-        if not self._load_ok:
-            self.running = False
-            return False
+        if self.remote.enabled:
+            # Nothing to load: no MLX import, no weights, no generation thread.
+            # A bad endpoint surfaces per-request rather than blocking startup,
+            # so the daemon still serves list_voices and comes up if the remote
+            # host is booting behind us.
+            print(f"Remote engine: {self.remote.label} "
+                  f"(model={self.remote.model}) — no local model will be loaded")
+            self._load_ok = True
+            self._ready.set()
+        else:
+            # Load + warm the model on the dedicated generation thread, then
+            # wait for it to be ready before we accept connections.
+            self._gen_thread = threading.Thread(target=self._generation_worker, daemon=True)
+            self._gen_thread.start()
+            self._ready.wait()
+            if not self._load_ok:
+                self.running = False
+                return False
 
         # Enhanced-service surface for relay's settings UI (status + voices.json
         # editor). Non-fatal: TTS on 9997 must work even if the inspector doesn't.
@@ -725,7 +890,8 @@ class RelayTTSDaemon:
 
     def stop(self):
         self.running = False
-        self._jobs.put(None)  # wake the generation thread so it can exit
+        if self._gen_thread is not None:
+            self._jobs.put(None)  # wake the generation thread so it can exit
         if self._bridge is not None:
             try:
                 self._bridge.stop()
@@ -765,9 +931,12 @@ class RelayTTSDaemon:
         """Read-only snapshot relay polls for the inspector. Counters only —
         must never touch the model (MLX is pinned to the generation thread)."""
         uptime = round(time.time() - self._start_time, 1) if self._start_time else 0
+        remote = self.remote.enabled
         return {
             "service": "relaytts-daemon",
-            "model": self.cfg.repo_id,
+            "engine": "remote" if remote else "local",
+            "endpoint": self.remote.label if remote else None,
+            "model": self.remote.model if remote else self.cfg.repo_id,
             "modelLoaded": self._load_ok,
             "port": self.port,
             "sampleRate": self.cfg.sample_rate,
