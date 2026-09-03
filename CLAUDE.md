@@ -149,7 +149,9 @@ Env: `RELAYTTS_REMOTE_URL` (enables remote mode and sets the base URL),
 ## Dependencies & supply chain
 
 `requirements.in` is intent; `requirements.txt` is the hash-pinned lockfile
-(`pip-compile --generate-hashes`). `requirements-remote.{in,txt}` is the same
+(`pip-compile --generate-hashes`). **Compile either lockfile with Python 3.11**,
+the version `setup_env.sh` builds the env with — pip-compile resolves against
+whatever interpreter runs it, and a newer one pins wheels 3.11 cannot install. `requirements-remote.{in,txt}` is the same
 pair for `--remote` — the two resolve to different versions because the full
 lock is constrained by mlx-audio and the remote one is not. `setup_env.sh`
 installs with `--require-hashes` and fails closed on any hash mismatch. To change a dep: edit
