@@ -11,6 +11,7 @@ import base64
 import io
 import json
 import os
+import struct
 import sys
 import urllib.error
 
@@ -472,6 +473,58 @@ def test_remote_env_model_overrides_config(tmp_path, monkeypatch):
     monkeypatch.setenv("RELAYTTS_REMOTE_MODEL", "env/wins")
     cfg = _make_config(str(tmp_path), remote=REMOTE_BLOCK)
     assert cfg.remote.model == "env/wins"
+
+
+# ── framing: probe vs truncation ──────────────────────────────────
+
+class _FakeSock:
+    """Serves a scripted byte stream, then behaves like a closed peer."""
+
+    def __init__(self, data=b""):
+        self._data = data
+
+    def recv(self, n):
+        if not self._data:
+            return b""
+        chunk, self._data = self._data[:n], self._data[n:]
+        return chunk
+
+
+def _daemon(tmp_path):
+    return relaytts_daemon.RelayTTSDaemon(_make_config(str(tmp_path)))
+
+
+def test_probe_disconnect_is_not_an_error(tmp_path):
+    """A health check opens the port and hangs up without sending. Normal —
+    and logging it as an error buries the truncated-request case that is not."""
+    try:
+        _daemon(tmp_path)._recv_request(_FakeSock(b""))
+    except relaytts_daemon.ClientDisconnected:
+        pass
+    else:
+        raise AssertionError("expected ClientDisconnected for a bare probe")
+
+
+def test_truncated_request_is_still_an_error(tmp_path):
+    try:
+        _daemon(tmp_path)._recv_request(_FakeSock(struct.pack(">I", 100) + b"abc"))
+    except relaytts_daemon.ClientDisconnected:
+        raise AssertionError("a truncated request must not be treated as a probe")
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("expected ConnectionError for a truncated request")
+
+
+def test_header_only_close_is_truncation_not_probe(tmp_path):
+    try:
+        _daemon(tmp_path)._recv_request(_FakeSock(struct.pack(">I", 50)))
+    except relaytts_daemon.ClientDisconnected:
+        raise AssertionError("a close after the header is truncation, not a probe")
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("expected ConnectionError")
 
 
 if __name__ == "__main__":

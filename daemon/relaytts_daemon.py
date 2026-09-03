@@ -304,6 +304,15 @@ def resample(audio: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
 
 # ── Remote engine ─────────────────────────────────────────────────
 
+class ClientDisconnected(Exception):
+    """The peer closed before sending any part of a request.
+
+    That is what a bare TCP health check looks like — connect, observe the port
+    is open, hang up. It is not an error, and logging it as one buries the
+    truncated-request case that is.
+    """
+
+
 class RemoteEngine:
     """Synthesis over HTTP against an OpenAI-compatible /v1/audio/speech server.
 
@@ -672,12 +681,18 @@ class RelayTTSDaemon:
 
     # ── TCP protocol (byte-compatible with the Kokoro daemon) ─────
 
-    def _recv_all(self, sock, length):
+    def _recv_all(self, sock, length, *, allow_empty=False):
+        """Read exactly `length` bytes. With allow_empty, a close before the
+        first byte raises ClientDisconnected rather than ConnectionError — the
+        caller passes it only for the header read, so a close *after* some bytes
+        arrived is still the truncation error it has always been."""
         chunks = []
         received = 0
         while received < length:
             chunk = sock.recv(min(length - received, 65536))
             if not chunk:
+                if allow_empty and received == 0:
+                    raise ClientDisconnected()
                 raise ConnectionError("Connection closed")
             chunks.append(chunk)
             received += len(chunk)
@@ -685,7 +700,7 @@ class RelayTTSDaemon:
 
     def _recv_request(self, sock):
         """Receive a length-prefixed JSON request (4-byte big-endian header)."""
-        header = self._recv_all(sock, 4)
+        header = self._recv_all(sock, 4, allow_empty=True)
         payload_len = struct.unpack("!I", header)[0]
 
         # Detect legacy raw-JSON clients (first byte is '{' or '[')
@@ -756,6 +771,10 @@ class RelayTTSDaemon:
                 **timing,
             })
 
+        except ClientDisconnected:
+            # A port probe, or a client that hung up before asking anything.
+            # Nothing to answer and nothing worth saying.
+            return
         except Exception as e:
             print(f"Error handling client {addr}: {e}")
             try:
