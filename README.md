@@ -158,6 +158,21 @@ relayTTS/
     └── test_relaytts.py       # pytest suite (incl. concurrency smoke test)
 ```
 
+## Built on
+
+This daemon is a thin protocol shell. The hard parts belong to other people:
+
+| | |
+|---|---|
+| [MLX](https://github.com/ml-explore/mlx) — Apple (MIT) | the array framework everything here runs on |
+| [mlx-audio](https://github.com/Blaizzy/mlx-audio) — Prince Canuma (MIT) | Qwen3-TTS inference on Apple Silicon; the local engine is a wrapper around it |
+| [Qwen3-TTS](https://huggingface.co/mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit) — Alibaba (Apache-2.0) | the model, and the instruction-driven delivery this daemon is built around |
+| [Kokoro](https://github.com/hexgrad/kokoro) — hexgrad (Apache-2.0) | the TTS daemon this replaced; its port and wire protocol are kept for compatibility, which is why old voice ids still resolve |
+| [mlx-community](https://huggingface.co/mlx-community) | the MLX conversions of the models above |
+| [soundfile](https://github.com/bastibe/python-soundfile) (BSD-3) · [NumPy](https://numpy.org) (BSD-3) · [PyYAML](https://pyyaml.org) (MIT) · [FFmpeg](https://ffmpeg.org) | encoding, arrays, config, and the pitch-preserving time-stretch |
+
+Neither engine reimplements speech synthesis. The local one calls mlx-audio; the remote one calls a server that does the same work elsewhere. What this repo adds is the daemon: a length-prefixed TCP protocol, a voice registry with hot reload, delivery/gain/speed handling, and the choice of where inference happens.
+
 ## Dependencies
 
 - macOS with Apple Silicon
