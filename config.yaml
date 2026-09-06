@@ -4,57 +4,59 @@
 # tuned without touching daemon code. The daemon reads this once at startup
 # (override the path with the RELAYTTS_CONFIG env var).
 #
-# Engine: Qwen3-TTS CustomVoice on Apple Silicon via mlx-audio. `speaker` is the
-# model's native speaker id (from the model's talker_config.spk_id); `instruct`
-# is that voice's default emotion/delivery. A per-request `instruct` overrides
-# the voice default. Qwen3's native speed= is a no-op, so the daemon applies a
-# pitch-preserving ffmpeg time-stretch for any speed != 1.0.
+# Engine: the daemon owns no model. Every synthesis is an OpenAI-compatible
+# POST to engine.remote.base_url/audio/speech. `speaker` (below, per voice) is
+# the remote server's CustomVoice speaker id; `instruct` is that voice's
+# default emotion/delivery. A per-request `instruct` overrides the voice
+# default. The remote server's `speed=` is treated as a no-op, so the daemon
+# applies a pitch-preserving ffmpeg time-stretch for any speed != 1.0.
 
 engine:
-  repo_id: mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit
   sample_rate: 24000
   lang_code: english
   temperature: 0.9
-  # Qwen3 Base checkpoint for voice cloning (kind="clone" voices in voices.json).
-  # A separate model from repo_id above, loaded lazily on the first clone request
-  # so its RAM is only paid when cloning is used. Swap the quant here to trade
-  # fidelity for RAM (0.6B is lighter, bf16 is heavier/higher quality).
-  clone_repo_id: mlx-community/Qwen3-TTS-12Hz-1.7B-Base-6bit
 
-  # Remote inference. Off by default: the daemon loads the models above and
-  # stands alone. Turn it on and the daemon loads NOTHING — no MLX, no weights,
-  # no generation thread — and every synthesis becomes an OpenAI-compatible
-  # POST to base_url/audio/speech instead. Everything else is unchanged: the
-  # voice registry, the instruct/speed/gain precedence, the time-stretch, and
-  # the TCP protocol on 9997 are all identical, so clients cannot tell.
+  # Remote inference endpoint — required. base_url and model are deployment
+  # facts, not source, so they are left blank here and set per machine via
+  # RELAYTTS_REMOTE_URL / RELAYTTS_REMOTE_MODEL (which override base_url/model
+  # below on their own). `model` is the id the remote server exposes, which
+  # need not match any local name; a router may prefix or alias its upstreams.
+  # If an LLM router fronts the inference server, point base_url at the
+  # router: it can hold the upstream credential, so no token has to live
+  # beside the daemon.
   #
-  # This is for running the daemon on a machine too small to hold the weights
-  # (a VM) while a host with the GPU does the work. If an LLM router fronts
-  # that server, prefer pointing base_url at the router: it can hold the
-  # upstream credential, so no token has to live beside the daemon, and it is
-  # often the only address already reachable from the VM.
+  # Transport security is fail-closed: https is required for any non-loopback
+  # base_url. ca_file, when set, is the ONLY trust anchor (system roots are
+  # not consulted alongside it) — the natural choice is relay's local CA at
+  # ~/Library/Application Support/Relay/ca.crt for relay-issued certificates.
+  # pin_sha256 additionally requires the leaf certificate's SHA-256
+  # fingerprint to match (comma-separated for multiple, colons optional). Get
+  # a fingerprint with:
   #
-  # Left blank on purpose: these are deployment facts, not source. Set them per
-  # machine via RELAYTTS_REMOTE_URL, which overrides base_url AND enables remote
-  # on its own — so a deployment never has to edit this tracked file, and no
-  # host's addresses end up in version control.
+  #   openssl s_client -connect host:port </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout
   #
-  # `model` is the id the REMOTE server exposes, which need not match repo_id
-  # above; a router may prefix or alias its upstreams. For example:
+  # There is no skip-verify / insecure flag, by design.
   #
-  #   base_url: http://198.51.100.10:8080/v1
+  #   base_url: https://198.51.100.10:8080/v1
   #   model: my-router/qwen3-tts-customvoice
   #   clone_model: my-router/qwen3-tts-base
+  #   ca_file: /Users/me/Library/Application Support/Relay/ca.crt
+  #   pin_sha256: ""
   #
   remote:
-    enabled: false
     base_url: ""
     model: ""
     clone_model: ""
     timeout: 120
+    ca_file: ""
+    pin_sha256: ""
     # Name of the env var holding a bearer token, if the endpoint needs one.
     # The token itself is never written here.
     api_key_env: RELAYTTS_REMOTE_API_KEY
+
+# Directory clone voices' `ref_audio` must resolve inside (relative paths in
+# voices.json are joined onto it). Default: `clone-audio` beside this file.
+clone_audio_dir: clone-audio
 
 # Voice used when a request omits `voice` or sends an unknown id.
 default_voice: anna

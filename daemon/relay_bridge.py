@@ -25,6 +25,7 @@ relay/docs/service-manifest.md):
 The Eve-facing TTS protocol (length-prefixed JSON on TCP 9997) is unchanged and
 unrelated — this module only adds the relay control-plane surface.
 """
+import hmac
 import json
 import os
 import secrets
@@ -87,14 +88,16 @@ def build_voice_schema(speakers: list) -> list:
     }]
 
 
-def build_clone_schema() -> list:
+def build_clone_schema(clone_audio_dir: str) -> list:
     """The ConfigDecl schema for cloned voices (the `clones` array).
 
     A clone voice = a reference recording (`ref_audio`, a 24 kHz WAV path) + its
     transcript (`ref_text`); the Base model reproduces that speaker. Reference
     audio comes in by file path because Relay's inspector edits config text and
-    can't take uploads. Delivery comes from the sample's prosody — `instruct`
-    does not apply (so there's no instruct field here)."""
+    can't take uploads. `ref_audio` must resolve inside `clone_audio_dir` (the
+    daemon rejects anything else), so the help text names that directory rather
+    than inviting an absolute path elsewhere. Delivery comes from the sample's
+    prosody — `instruct` does not apply (so there's no instruct field here)."""
     return [{
         "id": "clones",
         "label": "Cloned voices",
@@ -111,7 +114,8 @@ def build_clone_schema() -> list:
                 {"id": "name", "label": "Display name", "type": "text", "required": True},
                 {"id": "ref_audio", "label": "Reference audio (path)", "type": "text",
                  "required": True,
-                 "help": "Absolute path to a 24 kHz mono WAV of the voice to clone."},
+                 "help": f"Path to a 24 kHz mono WAV, relative to {clone_audio_dir} "
+                         "(or absolute inside it)."},
                 {"id": "ref_text", "label": "Reference transcript", "type": "textarea",
                  "required": True, "help": "The exact words spoken in the reference audio."},
                 {"id": "lang", "label": "Language", "type": "text", "placeholder": "English",
@@ -126,7 +130,8 @@ def build_clone_schema() -> list:
     }]
 
 
-def build_manifest(service_id: str, config_path: str, speakers: list) -> dict:
+def build_manifest(service_id: str, config_path: str, speakers: list,
+                   clone_audio_dir: str) -> dict:
     """Assemble the manifest relay validates and stores.
 
     `routes` must be non-empty (relay rejects an empty list), but Eve talks to
@@ -146,7 +151,7 @@ def build_manifest(service_id: str, config_path: str, speakers: list) -> dict:
             "help": ("Custom voices for relayTTS — they appear in Eve's voice "
                      "picker. Built-in voices live in config.yaml."),
             "applyMode": "live",
-            "schema": build_voice_schema(speakers) + build_clone_schema(),
+            "schema": build_voice_schema(speakers) + build_clone_schema(clone_audio_dir),
         },
     }
 
@@ -173,8 +178,8 @@ class _StatusHandler(BaseHTTPRequestHandler):
     """Serves GET /api/status on the internal socket, bearer-gated.
 
     Relay is the only reachable client (0600 socket, same uid); the bearer is
-    defense in depth. Status is read-only counters — it must never call the
-    model (MLX is pinned to the generation thread)."""
+    defense in depth. Status is read-only counters — it must never make a
+    remote synthesis call."""
 
     def do_GET(self):
         if not self._authorized():
@@ -190,7 +195,9 @@ class _StatusHandler(BaseHTTPRequestHandler):
             self._send(404, b'{"error":"not found"}')
 
     def _authorized(self) -> bool:
-        if self.headers.get("Authorization") != "Bearer " + self.server.token:
+        header = self.headers.get("Authorization")
+        if header is None or not hmac.compare_digest(
+                header.encode("utf-8"), ("Bearer " + self.server.token).encode("utf-8")):
             self._send(401, b'{"error":"unauthorized"}')
             return False
         return True
@@ -223,6 +230,35 @@ class _UnixHTTPServer(socketserver.ThreadingUnixStreamServer):
         super().__init__(sock_path, _StatusHandler)
 
 
+def _sweep_stale_bridge_dirs():
+    """Remove leftover relaytts-bridge-* temp dirs from daemons that are no
+    longer running.
+
+    Only `stop()` cleans up its own dir, so a crash or a supervisor restart
+    leaks one every time. A dir's internal.sock still accepting connections is
+    the one signal that its daemon is alive; anything else (no socket, or a
+    connection it refuses) means it's safe to remove.
+    """
+    base = tempfile.gettempdir()
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith("relaytts-bridge-"):
+            continue
+        path = os.path.join(base, name)
+        sock_path = os.path.join(path, "internal.sock")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+                c.settimeout(0.2)
+                c.connect(sock_path)
+        except (FileNotFoundError, ConnectionRefusedError):
+            shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass  # anything else is inconclusive; leave it rather than guess
+
+
 # ── Bridge client / lifecycle ─────────────────────────────────────
 
 class RelayBridge:
@@ -233,7 +269,7 @@ class RelayBridge:
     daemon must serve Eve on 9997 even if the inspector never comes up."""
 
     def __init__(self, status_provider, config_path: str, speakers: list,
-                 service_id: str = None):
+                 clone_audio_dir: str, service_id: str = None):
         self.bridge_sock = os.environ.get(ENV_BRIDGE_SOCKET, "")
         self.service_id = service_id or os.environ.get(ENV_SERVICE_ID, "")
         self.token = (os.environ.get(ENV_SERVICE_TOKEN)
@@ -241,6 +277,7 @@ class RelayBridge:
         self.status_provider = status_provider
         self.config_path = config_path
         self.speakers = list(speakers)
+        self.clone_audio_dir = clone_audio_dir
         self.internal_token = secrets.token_hex(32)
         self.internal_sock = None
         self._dir = None
@@ -254,6 +291,7 @@ class RelayBridge:
     def start(self):
         if not self.enabled:
             raise RuntimeError("relay bridge env not present (standalone mode)")
+        _sweep_stale_bridge_dirs()
         self._dir = tempfile.mkdtemp(prefix="relaytts-bridge-")
         self.internal_sock = os.path.join(self._dir, "internal.sock")
         self._server = _UnixHTTPServer(self.internal_sock, self.internal_token,
@@ -265,7 +303,8 @@ class RelayBridge:
         self._register()
 
     def _register(self):
-        manifest = build_manifest(self.service_id, self.config_path, self.speakers)
+        manifest = build_manifest(self.service_id, self.config_path, self.speakers,
+                                  self.clone_audio_dir)
         payload = build_register_payload(self.service_id, manifest,
                                          self.internal_sock, self.internal_token,
                                          self.token)

@@ -12,3 +12,6 @@ SUMMARY.md
 # User-defined custom voices — runtime state, seeded empty by the daemon and
 # edited via Relay's settings inspector. Not source.
 voices.json
+
+# Reference recordings for cloned voices — runtime state, not source.
+clone-audio/

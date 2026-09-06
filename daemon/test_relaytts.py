@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""Unit tests for the parts of the daemon that don't need the model: custom
-voice loading/merge/resolve precedence, and the relay manifest/registration
-framing. Runs under pytest, or standalone (`python test_relaytts.py`).
+"""Unit tests for the parts of the daemon that don't need a real upstream:
+custom voice loading/merge/resolve precedence, the relay manifest/registration
+framing, and the remote engine (transport + pinning) with a faked or
+in-process-TLS server. Runs under pytest, or standalone (`python test_relaytts.py`).
 
 Importing relaytts_daemon pulls in numpy/soundfile/yaml (present in the relaytts
-env) but NOT mlx-audio — the model is loaded lazily inside load_model(), so
-these stay fast and model-free.
+env) — there is no model dependency to keep out, since the daemon never loads one.
 """
 import base64
+import hashlib
+import http.server
 import io
 import json
 import os
+import shutil
+import socket
+import ssl
 import struct
+import subprocess
 import sys
+import threading
 import urllib.error
+
+import numpy as np
 
 try:
     import pytest
@@ -22,13 +31,13 @@ except ImportError:  # the fallback runner at the bottom covers this
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import pinned_transport
 import relay_bridge
 import relaytts_daemon
 from relaytts_daemon import Config, RemoteEngine
 
 CONFIG_YAML = """
 engine:
-  repo_id: test/model
   sample_rate: 24000
   lang_code: english
   temperature: 0.9
@@ -43,10 +52,17 @@ voice_aliases:
 """
 
 
+# Config now requires a URL and a model unconditionally, so every _make_config
+# call needs a remote block; this is the one tests use unless they override it.
+DEFAULT_REMOTE_BLOCK = """
+  remote:
+    base_url: https://198.51.100.10:8080/v1
+    model: test/model
+"""
+
 REMOTE_BLOCK = """
   remote:
-    enabled: true
-    base_url: http://198.51.100.10:8080/v1/
+    base_url: https://198.51.100.10:8080/v1/
     model: upstream/custom-voice
     clone_model: upstream/base
 """
@@ -57,8 +73,9 @@ def _make_config(tmp_dir, custom=None, clones=None, remote=None):
     with open(cfg_path, "w") as f:
         # The remote block belongs under `engine:`, which CONFIG_YAML ends at
         # `temperature`, so appending there keeps the indentation right.
-        f.write(CONFIG_YAML.replace("  temperature: 0.9\n",
-                                    "  temperature: 0.9\n" + (remote or "")))
+        f.write(CONFIG_YAML.replace(
+            "  temperature: 0.9\n",
+            "  temperature: 0.9\n" + (remote if remote is not None else DEFAULT_REMOTE_BLOCK)))
     voices_path = os.path.join(tmp_dir, "voices.json")
     if custom is not None or clones is not None:
         with open(voices_path, "w") as f:
@@ -154,11 +171,11 @@ def test_speakers_list_for_schema(tmp_path):
 def test_clone_voice_loaded_and_resolved(tmp_path):
     cfg = _make_config(str(tmp_path), clones=[
         {"id": "my_voice", "name": "My Voice", "lang": "English", "gender": "M",
-         "ref_audio": "/some/ref.wav", "ref_text": "Hello there.", "gain": 1.1, "speed": 1.0},
+         "ref_audio": "ref.wav", "ref_text": "Hello there.", "gain": 1.1, "speed": 1.0},
     ])
     assert cfg.voice_counts() == {"builtin": 2, "custom": 0, "clone": 1, "total": 3}
     spec = cfg.resolve("my_voice")
-    assert spec == {"kind": "clone", "ref_audio": "/some/ref.wav",
+    assert spec == {"kind": "clone", "ref_audio": os.path.join(cfg.clone_audio_dir, "ref.wav"),
                     "ref_text": "Hello there.", "gain": 1.1, "speed": 1.0}
     assert [v["id"] for v in cfg.public_voices()] == ["anna", "ryan", "my_voice"]
     # clone speakers must NOT pollute by_speaker (no "speaker" key on clones)
@@ -168,34 +185,71 @@ def test_clone_voice_loaded_and_resolved(tmp_path):
 def test_clone_requires_ref_audio_and_text(tmp_path):
     cfg = _make_config(str(tmp_path), clones=[
         {"id": "no_audio", "ref_text": "hi"},                 # missing ref_audio
-        {"id": "no_text", "ref_audio": "/x.wav"},             # missing ref_text
-        {"ref_audio": "/y.wav", "ref_text": "hi"},            # missing id
-        {"id": "ok", "ref_audio": "/z.wav", "ref_text": "ok"},
+        {"id": "no_text", "ref_audio": "x.wav"},              # missing ref_text
+        {"ref_audio": "y.wav", "ref_text": "hi"},             # missing id
+        {"id": "ok", "ref_audio": "z.wav", "ref_text": "ok"},
     ])
     assert cfg.voice_counts()["clone"] == 1
-    assert cfg.resolve("ok")["ref_audio"] == "/z.wav"
+    assert cfg.resolve("ok")["ref_audio"] == os.path.join(cfg.clone_audio_dir, "z.wav")
 
 
 def test_custom_and_clone_coexist(tmp_path):
     cfg = _make_config(
         str(tmp_path),
         custom=[{"id": "narrator", "base_speaker": "ryan", "instruct": "Slow."}],
-        clones=[{"id": "cloned", "ref_audio": "/r.wav", "ref_text": "hi"}],
+        clones=[{"id": "cloned", "ref_audio": "r.wav", "ref_text": "hi"}],
     )
     assert cfg.voice_counts() == {"builtin": 2, "custom": 1, "clone": 1, "total": 4}
 
 
+# ── clone audio confinement ─────────────────────────────────────────
+
+def test_clone_audio_path_relative_inside(tmp_path):
+    cfg = _make_config(str(tmp_path))
+    assert cfg.clone_audio_path("sample.wav") == os.path.join(cfg.clone_audio_dir, "sample.wav")
+
+
+def test_clone_audio_path_absolute_inside(tmp_path):
+    cfg = _make_config(str(tmp_path))
+    target = os.path.join(cfg.clone_audio_dir, "sample.wav")
+    assert cfg.clone_audio_path(target) == target
+
+
+def test_clone_audio_path_absolute_outside_rejected(tmp_path):
+    cfg = _make_config(str(tmp_path))
+    assert cfg.clone_audio_path(str(tmp_path / "elsewhere.wav")) is None
+
+
+def test_clone_audio_path_symlink_escape_rejected(tmp_path):
+    cfg = _make_config(str(tmp_path))
+    os.makedirs(cfg.clone_audio_dir, exist_ok=True)
+    outside = tmp_path / "outside.wav"
+    outside.write_bytes(b"not audio")
+    link = os.path.join(cfg.clone_audio_dir, "escape.wav")
+    os.symlink(str(outside), link)
+    assert cfg.clone_audio_path("escape.wav") is None
+
+
+def test_normalize_clone_drops_ref_audio_outside_dir(tmp_path, capsys):
+    cfg = _make_config(str(tmp_path), clones=[
+        {"id": "escapee", "ref_audio": str(tmp_path / "elsewhere.wav"), "ref_text": "hi"},
+    ])
+    assert cfg.voice_counts()["clone"] == 0
+    assert "must be inside" in capsys.readouterr().out
+
+
 def test_build_clone_schema_shape():
-    schema = relay_bridge.build_clone_schema()
+    schema = relay_bridge.build_clone_schema("/data/clone-audio")
     assert schema[0]["id"] == "clones" and schema[0]["type"] == "array"
     fields = {f["id"]: f for f in schema[0]["item"]["fields"]}
     assert fields["ref_audio"]["required"] is True
+    assert "/data/clone-audio" in fields["ref_audio"]["help"]
     assert fields["ref_text"]["type"] == "textarea"
     assert "base_speaker" not in fields and "instruct" not in fields  # not for clones
 
 
 def test_manifest_includes_both_arrays():
-    m = relay_bridge.build_manifest("svc", "/abs/v.json", ["a"])
+    m = relay_bridge.build_manifest("svc", "/abs/v.json", ["a"], "/data/clone-audio")
     ids = [f["id"] for f in m["config"]["schema"]]
     assert ids == ["voices", "clones"]
 
@@ -212,7 +266,7 @@ def test_build_voice_schema_has_speaker_select():
 
 
 def test_build_manifest_shape():
-    m = relay_bridge.build_manifest("relaytts-daemon", "/abs/voices.json", ["a"])
+    m = relay_bridge.build_manifest("relaytts-daemon", "/abs/voices.json", ["a"], "/data/clone-audio")
     assert m["routes"] == ["/api/relaytts-daemon/"]   # non-empty (relay requires it)
     assert m["status"]["path"] == "/api/status"
     assert m["config"]["path"] == "/abs/voices.json"
@@ -221,7 +275,7 @@ def test_build_manifest_shape():
 
 
 def test_register_payload_framing():
-    m = relay_bridge.build_manifest("svc", "/abs/v.json", ["a"])
+    m = relay_bridge.build_manifest("svc", "/abs/v.json", ["a"], "/data/clone-audio")
     raw = relay_bridge.build_register_payload("svc", m, "/tmp/i.sock", "itok", "stok")
     assert raw.endswith(b"\n")
     msg = json.loads(raw)
@@ -234,42 +288,47 @@ def test_register_payload_framing():
     assert args["manifest"]["status"]["path"] == "/api/status"
 # ── Remote engine ─────────────────────────────────────────────────
 
-def test_remote_disabled_by_default(tmp_path):
-    cfg = _make_config(str(tmp_path))
-    assert cfg.remote.enabled is False
-
-
-def test_remote_enabled_from_config(tmp_path):
+def test_remote_reads_config(tmp_path):
     cfg = _make_config(str(tmp_path), remote=REMOTE_BLOCK)
-    assert cfg.remote.enabled is True
     assert cfg.remote.model == "upstream/custom-voice"
     assert cfg.remote.clone_model == "upstream/base"
     # Trailing slash on base_url must not double up in the joined path.
-    assert cfg.remote.speech_url == "http://198.51.100.10:8080/v1/audio/speech"
+    assert cfg.remote.speech_url == "https://198.51.100.10:8080/v1/audio/speech"
 
 
-def test_remote_env_url_enables_and_overrides(tmp_path, monkeypatch):
-    """RELAYTTS_REMOTE_URL alone flips a deployment to remote, so a supervisor
-    can do it without editing a tracked config file."""
-    monkeypatch.setenv("RELAYTTS_REMOTE_URL", "http://host:9999/v1")
+def test_remote_env_url_overrides_config(tmp_path, monkeypatch):
+    """RELAYTTS_REMOTE_URL is a deployment fact, so it overrides whatever
+    base_url config.yaml happens to carry, without editing the tracked file."""
+    monkeypatch.setenv("RELAYTTS_REMOTE_URL", "https://host:9999/v1")
     cfg = _make_config(str(tmp_path), remote="""
   remote:
-    enabled: false
-    base_url: http://ignored:1/v1
+    base_url: https://ignored:1/v1
     model: upstream/custom-voice
 """)
-    assert cfg.remote.enabled is True
-    assert cfg.remote.speech_url == "http://host:9999/v1/audio/speech"
+    assert cfg.remote.speech_url == "https://host:9999/v1/audio/speech"
 
 
-def test_remote_enabled_without_model_is_fatal(tmp_path):
-    """Failing at load is the point: a remote daemon with no model id would
-    otherwise start clean and 400 on every synthesis."""
+def test_missing_url_is_fatal(tmp_path):
+    """No base_url anywhere (config or env) must fail the daemon at startup,
+    not on the first request."""
     try:
         _make_config(str(tmp_path), remote="""
   remote:
-    enabled: true
-    base_url: http://198.51.100.10:8080/v1
+    model: upstream/custom-voice
+""")
+    except ValueError as e:
+        assert "base_url" in str(e)
+    else:
+        raise AssertionError("expected ValueError for a missing base_url")
+
+
+def test_missing_model_is_fatal(tmp_path):
+    """A remote daemon with no model id would otherwise start clean and 400
+    on every synthesis; fail at construction instead."""
+    try:
+        _make_config(str(tmp_path), remote="""
+  remote:
+    base_url: https://198.51.100.10:8080/v1
 """)
     except ValueError as e:
         assert "engine.remote.model" in str(e)
@@ -280,8 +339,7 @@ def test_remote_enabled_without_model_is_fatal(tmp_path):
 def test_remote_clone_model_falls_back_to_model(tmp_path):
     cfg = _make_config(str(tmp_path), remote="""
   remote:
-    enabled: true
-    base_url: http://198.51.100.10:8080/v1
+    base_url: https://198.51.100.10:8080/v1
     model: upstream/only
 """)
     assert cfg.remote.clone_model == "upstream/only"
@@ -291,8 +349,7 @@ def test_remote_api_key_read_from_named_env_var(tmp_path, monkeypatch):
     monkeypatch.setenv("MY_TTS_TOKEN", "s3cret")
     cfg = _make_config(str(tmp_path), remote="""
   remote:
-    enabled: true
-    base_url: http://198.51.100.10:8080/v1
+    base_url: https://198.51.100.10:8080/v1
     model: upstream/custom-voice
     api_key_env: MY_TTS_TOKEN
 """)
@@ -309,6 +366,20 @@ def test_error_detail_unwraps_openai_shape():
 
 def test_error_detail_passes_through_non_json():
     assert RemoteEngine._error_detail(b"upstream exploded") == "upstream exploded"
+
+
+def test_remote_engine_rejects_non_loopback_http():
+    try:
+        RemoteEngine({"base_url": "http://198.51.100.10:8080/v1", "model": "m"})
+    except ValueError as e:
+        assert "non-loopback" in str(e)
+    else:
+        raise AssertionError("expected ValueError for plain http to a non-loopback host")
+
+
+def test_remote_engine_allows_loopback_http():
+    engine = RemoteEngine({"base_url": "http://127.0.0.1:8080/v1", "model": "m"})
+    assert engine.speech_url == "http://127.0.0.1:8080/v1/audio/speech"
 
 
 def _wav_bytes(seconds=0.5, sr=24000):
@@ -336,30 +407,42 @@ class _FakeResponse:
         return False
 
 
-def _capture_request(monkeypatch, body=None):
-    """Intercept urlopen and hand back the Request the engine built."""
+class _FakeOpener:
+    """Stands in for the urllib opener RemoteEngine builds, so payload-shape
+    tests don't need a real socket. `open_fn(req, timeout=None)` gets the
+    exact Request the engine built."""
+
+    def __init__(self, open_fn):
+        self._open_fn = open_fn
+
+    def open(self, req, timeout=None):
+        return self._open_fn(req, timeout=timeout)
+
+
+def _capture_request(engine, monkeypatch, body=None):
+    """Replace engine._opener and hand back the Request the engine built."""
     seen = {}
 
-    def fake_urlopen(req, timeout=None):
+    def fake_open(req, timeout=None):
         seen["url"] = req.full_url
         seen["headers"] = dict(req.header_items())
         seen["payload"] = json.loads(req.data.decode())
         seen["timeout"] = timeout
         return _FakeResponse(body if body is not None else _wav_bytes())
 
-    monkeypatch.setattr(relaytts_daemon.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(engine, "_opener", _FakeOpener(fake_open))
     return seen
 
 
 def test_remote_preset_payload_shape(tmp_path, monkeypatch):
     cfg = _make_config(str(tmp_path), remote=REMOTE_BLOCK)
-    seen = _capture_request(monkeypatch)
+    seen = _capture_request(cfg.remote, monkeypatch)
     spec = cfg.resolve("ryan")
 
     audio = cfg.remote.synthesize(spec, "Hello there.", "english",
                                   "Confident.", 0.9, 24000)
 
-    assert seen["url"] == "http://198.51.100.10:8080/v1/audio/speech"
+    assert seen["url"] == "https://198.51.100.10:8080/v1/audio/speech"
     assert seen["payload"] == {
         "model": "upstream/custom-voice",
         "voice": "ryan",
@@ -379,7 +462,7 @@ def test_remote_omits_instructions_when_none(tmp_path, monkeypatch):
     """A null instruct means 'use the server voice's own delivery' — sending
     an empty string instead would flatten the voice's character."""
     cfg = _make_config(str(tmp_path), remote=REMOTE_BLOCK)
-    seen = _capture_request(monkeypatch)
+    seen = _capture_request(cfg.remote, monkeypatch)
     cfg.remote.synthesize(cfg.resolve("ryan"), "Hi.", "english", None, 0.9, 24000)
     assert "instructions" not in seen["payload"]
 
@@ -387,11 +470,13 @@ def test_remote_omits_instructions_when_none(tmp_path, monkeypatch):
 def test_remote_clone_sends_base64_reference(tmp_path, monkeypatch):
     """The reference recording lives beside the daemon, so it has to travel
     with the request — the remote server has no access to that path."""
-    ref = tmp_path / "ref.wav"
+    clone_dir = tmp_path / "clone-audio"
+    clone_dir.mkdir()
+    ref = clone_dir / "ref.wav"
     ref.write_bytes(_wav_bytes(0.25))
     cfg = _make_config(str(tmp_path), remote=REMOTE_BLOCK, clones=[
-        {"id": "mine", "name": "Mine", "ref_audio": str(ref), "ref_text": "A sample."}])
-    seen = _capture_request(monkeypatch)
+        {"id": "mine", "name": "Mine", "ref_audio": "ref.wav", "ref_text": "A sample."}])
+    seen = _capture_request(cfg.remote, monkeypatch)
 
     cfg.remote.synthesize(cfg.resolve("mine"), "Hello.", "english", None, 0.9, 24000)
 
@@ -401,15 +486,40 @@ def test_remote_clone_sends_base64_reference(tmp_path, monkeypatch):
     assert "voice" not in seen["payload"]
 
 
+def test_remote_clone_refuses_non_audio_file(tmp_path, monkeypatch):
+    """The reference bytes ship upstream on every request, so a non-audio file
+    behind ref_audio must be rejected before the opener is ever touched."""
+    cfg = _make_config(str(tmp_path), remote=REMOTE_BLOCK)
+    os.makedirs(cfg.clone_audio_dir, exist_ok=True)
+    with open(os.path.join(cfg.clone_audio_dir, "notaudio.txt"), "w") as f:
+        f.write("not audio")
+    with open(cfg.custom_voices_path, "w") as f:
+        json.dump({"voices": [], "clones": [
+            {"id": "bad", "ref_audio": "notaudio.txt", "ref_text": "hi"}]}, f)
+    cfg.reload_custom()
+
+    def boom(req, timeout=None):
+        raise AssertionError("the opener should not be reached")
+
+    monkeypatch.setattr(cfg.remote, "_opener", _FakeOpener(boom))
+    daemon = relaytts_daemon.RelayTTSDaemon(cfg)
+    try:
+        daemon.synthesize("Hello.", voice="bad")
+    except RuntimeError as e:
+        assert "not decodable audio" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
 def test_remote_sends_bearer_only_when_configured(tmp_path, monkeypatch):
     cfg = _make_config(str(tmp_path), remote=REMOTE_BLOCK)
-    seen = _capture_request(monkeypatch)
+    seen = _capture_request(cfg.remote, monkeypatch)
     cfg.remote.synthesize(cfg.resolve("ryan"), "Hi.", "english", None, 0.9, 24000)
     assert not any(k.lower() == "authorization" for k in seen["headers"])
 
     monkeypatch.setenv("RELAYTTS_REMOTE_API_KEY", "tok")
     cfg2 = _make_config(str(tmp_path), remote=REMOTE_BLOCK)
-    seen2 = _capture_request(monkeypatch)
+    seen2 = _capture_request(cfg2.remote, monkeypatch)
     cfg2.remote.synthesize(cfg2.resolve("ryan"), "Hi.", "english", None, 0.9, 24000)
     assert seen2["headers"]["Authorization"] == "Bearer tok"
 
@@ -422,7 +532,7 @@ def test_remote_http_error_names_endpoint_and_reason(tmp_path, monkeypatch):
             req.full_url, 400, "Bad Request", {},
             io.BytesIO(b'{"error":{"message":"unknown model"}}'))
 
-    monkeypatch.setattr(relaytts_daemon.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(cfg.remote, "_opener", _FakeOpener(boom))
     with pytest.raises(RuntimeError) as e:
         cfg.remote.synthesize(cfg.resolve("ryan"), "Hi.", "english", None, 0.9, 24000)
     assert "198.51.100.10:8080" in str(e.value)
@@ -435,26 +545,24 @@ def test_remote_unreachable_error_is_actionable(tmp_path, monkeypatch):
     def boom(req, timeout=None):
         raise urllib.error.URLError("Connection refused")
 
-    monkeypatch.setattr(relaytts_daemon.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(cfg.remote, "_opener", _FakeOpener(boom))
     with pytest.raises(RuntimeError, match="unreachable"):
         cfg.remote.synthesize(cfg.resolve("ryan"), "Hi.", "english", None, 0.9, 24000)
 
 
 def test_remote_undecodable_body_is_reported(tmp_path, monkeypatch):
     cfg = _make_config(str(tmp_path), remote=REMOTE_BLOCK)
-    _capture_request(monkeypatch, body=b"<html>proxy error</html>")
+    _capture_request(cfg.remote, monkeypatch, body=b"<html>proxy error</html>")
     with pytest.raises(RuntimeError, match="not decodable audio"):
         cfg.remote.synthesize(cfg.resolve("ryan"), "Hi.", "english", None, 0.9, 24000)
 
 
 def test_remote_model_from_env(tmp_path, monkeypatch):
-    """The model id is a deployment fact like the URL. Without an env var for
-    it, the documented one-liner deploy could not work at all — the tracked
-    config would have to carry half the endpoint."""
-    monkeypatch.setenv("RELAYTTS_REMOTE_URL", "http://198.51.100.10:8080/v1")
+    """The model id is a deployment fact like the URL: env overrides whatever
+    config.yaml's remote block happens to declare."""
+    monkeypatch.setenv("RELAYTTS_REMOTE_URL", "https://198.51.100.10:8080/v1")
     monkeypatch.setenv("RELAYTTS_REMOTE_MODEL", "router/customvoice")
-    cfg = _make_config(str(tmp_path))  # config.yaml carries no remote block
-    assert cfg.remote.enabled is True
+    cfg = _make_config(str(tmp_path))
     assert cfg.remote.model == "router/customvoice"
     # Clone falls back to the same id rather than erroring, so a deployment
     # that never clones does not have to configure a second model.
@@ -462,7 +570,7 @@ def test_remote_model_from_env(tmp_path, monkeypatch):
 
 
 def test_remote_clone_model_from_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("RELAYTTS_REMOTE_URL", "http://198.51.100.10:8080/v1")
+    monkeypatch.setenv("RELAYTTS_REMOTE_URL", "https://198.51.100.10:8080/v1")
     monkeypatch.setenv("RELAYTTS_REMOTE_MODEL", "router/customvoice")
     monkeypatch.setenv("RELAYTTS_REMOTE_CLONE_MODEL", "router/base")
     cfg = _make_config(str(tmp_path))
@@ -475,13 +583,293 @@ def test_remote_env_model_overrides_config(tmp_path, monkeypatch):
     assert cfg.remote.model == "env/wins"
 
 
+def test_remote_ca_and_pins_reach_engine_from_config(tmp_path):
+    """A real CA file is needed here (not just a path string): RemoteEngine
+    construction runs assert_transport_config, which requires ca_file to
+    actually exist and parse as a CA bundle."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not installed")
+    ca = _make_test_ca(tmp_path)
+    pin = "AA:BB:" + "cc" * 30  # 64 hex chars once colons are stripped
+    cfg = _make_config(str(tmp_path), remote=f"""
+  remote:
+    base_url: https://198.51.100.10:8080/v1
+    model: upstream/custom-voice
+    ca_file: "{ca['ca_cert']}"
+    pin_sha256: "{pin}"
+""")
+    assert cfg.remote.ca_file == ca["ca_cert"]
+    assert cfg.remote.pins == ["aabb" + "cc" * 30]
+
+
+def test_remote_env_ca_and_pin_override_config(tmp_path, monkeypatch):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not installed")
+    ca = _make_test_ca(tmp_path)
+    monkeypatch.setenv("RELAYTTS_REMOTE_CA", ca["ca_cert"])
+    monkeypatch.setenv("RELAYTTS_REMOTE_PIN_SHA256", "d" * 64)
+    cfg = _make_config(str(tmp_path), remote="""
+  remote:
+    base_url: https://198.51.100.10:8080/v1
+    model: upstream/custom-voice
+    ca_file: /path/to/ignored-ca.pem
+    pin_sha256: "aa"
+""")
+    assert cfg.remote.ca_file == ca["ca_cert"]
+    assert cfg.remote.pins == ["d" * 64]
+
+
+# ── pinned_transport: assert_transport_config / parse_pins ─────────
+
+def test_assert_transport_config_missing_url_is_fatal():
+    try:
+        pinned_transport.assert_transport_config("", None, [])
+    except ValueError as e:
+        assert "base_url" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_assert_transport_config_bad_scheme_is_fatal():
+    try:
+        pinned_transport.assert_transport_config("ftp://host/v1", None, [])
+    except ValueError as e:
+        assert "http or https" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_assert_transport_config_http_non_loopback_is_fatal():
+    try:
+        pinned_transport.assert_transport_config("http://example.com/v1", None, [])
+    except ValueError as e:
+        assert "non-loopback" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_assert_transport_config_http_loopback_is_ok():
+    for netloc in ("127.0.0.1:9999", "localhost:9999", "[::1]:9999"):
+        pinned_transport.assert_transport_config(f"http://{netloc}/v1", None, [])
+
+
+def test_assert_transport_config_http_with_pins_is_fatal():
+    try:
+        pinned_transport.assert_transport_config(
+            "http://127.0.0.1:9999/v1", None, ["a" * 64])
+    except ValueError as e:
+        assert "http" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_assert_transport_config_http_with_ca_file_is_fatal(tmp_path):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("not a real cert")
+    try:
+        pinned_transport.assert_transport_config(
+            "http://127.0.0.1:9999/v1", str(ca), [])
+    except ValueError as e:
+        assert "http" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_assert_transport_config_missing_ca_file_is_fatal(tmp_path):
+    try:
+        pinned_transport.assert_transport_config(
+            "https://host/v1", str(tmp_path / "missing.pem"), [])
+    except ValueError as e:
+        assert "ca_file" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_assert_transport_config_malformed_pin_is_fatal():
+    try:
+        pinned_transport.assert_transport_config("https://host/v1", None, ["not-a-fingerprint"])
+    except ValueError as e:
+        assert "pin_sha256" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_assert_transport_config_https_with_pin_is_ok():
+    pinned_transport.assert_transport_config("https://host/v1", None, ["a" * 64])
+
+
+def test_parse_pins_normalizes_string_with_colons():
+    pin = "AA:BB:CC:" + "dd" * 28 + "EE"  # 64 hex chars once colons are stripped
+    assert pinned_transport.parse_pins(pin) == [pin.replace(":", "").lower()]
+
+
+def test_parse_pins_accepts_list_input():
+    pins = ["A" * 64, "b" * 64]
+    assert pinned_transport.parse_pins(pins) == ["a" * 64, "b" * 64]
+
+
+def test_parse_pins_empty_input_yields_no_pins():
+    assert pinned_transport.parse_pins(None) == []
+    assert pinned_transport.parse_pins("") == []
+
+
+# ── pinned_transport: real TLS, in-process ──────────────────────────
+#
+# A real CA + two leaf certs via the openssl CLI, and a real TLS server in a
+# background thread, so the pinning path is exercised against actual
+# handshakes and actual fingerprints rather than mocks of the ssl module.
+
+def _run_openssl(*args):
+    subprocess.run(["openssl", *args], check=True, capture_output=True)
+
+
+def _make_test_ca(tmp_path):
+    """A self-signed CA plus two leaf certs (distinct keys), both signed by
+    that CA and valid for localhost/127.0.0.1. Returns the CA cert path and a
+    list of {cert, key, fingerprint} for the two leaves."""
+    ca_key = tmp_path / "ca.key"
+    ca_cert = tmp_path / "ca.crt"
+    _run_openssl("genrsa", "-out", str(ca_key), "2048")
+    _run_openssl("req", "-x509", "-new", "-nodes", "-key", str(ca_key),
+                 "-sha256", "-days", "2", "-out", str(ca_cert),
+                 "-subj", "/CN=relaytts-test-ca")
+
+    # Hostname verification needs a SAN, not just a CN.
+    ext_file = tmp_path / "leaf.ext"
+    ext_file.write_text("subjectAltName=DNS:localhost,IP:127.0.0.1\n")
+
+    leaves = []
+    for i in (1, 2):
+        key = tmp_path / f"leaf{i}.key"
+        csr = tmp_path / f"leaf{i}.csr"
+        cert = tmp_path / f"leaf{i}.crt"
+        _run_openssl("genrsa", "-out", str(key), "2048")
+        _run_openssl("req", "-new", "-key", str(key), "-out", str(csr),
+                     "-subj", f"/CN=leaf{i}.relaytts-test")
+        _run_openssl("x509", "-req", "-in", str(csr), "-CA", str(ca_cert),
+                     "-CAkey", str(ca_key), "-CAcreateserial", "-out", str(cert),
+                     "-days", "2", "-sha256", "-extfile", str(ext_file))
+        der = ssl.PEM_cert_to_DER_cert(cert.read_text())
+        leaves.append({
+            "cert": str(cert), "key": str(key),
+            "fingerprint": hashlib.sha256(der).hexdigest(),
+        })
+    return {"ca_cert": str(ca_cert), "leaves": leaves}
+
+
+class _SpeechHandler(http.server.BaseHTTPRequestHandler):
+    """Answers POST /v1/audio/speech with a short silent WAV, so
+    RemoteEngine.synthesize can complete end to end over the real handshake."""
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)  # drain the request body
+        body = _wav_bytes(0.1, 24000)
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def _start_tls_server(cert_path, key_path):
+    """Start the speech handler over TLS on an ephemeral loopback port."""
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), _SpeechHandler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return httpd, httpd.server_address[1]
+
+
+_PRESET_SPEC = {"kind": "preset", "speaker": "ryan"}
+
+
+def test_tls_ca_verified_no_pins_succeeds(tmp_path):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not installed")
+    ca = _make_test_ca(tmp_path)
+    leaf = ca["leaves"][0]
+    httpd, port = _start_tls_server(leaf["cert"], leaf["key"])
+    try:
+        engine = RemoteEngine({"base_url": f"https://127.0.0.1:{port}/v1",
+                               "model": "test/model", "ca_file": ca["ca_cert"]})
+        audio = engine.synthesize(_PRESET_SPEC, "hi", "english", None, 0.9, 24000)
+        assert len(audio) > 0
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_tls_without_ca_file_fails_verification(tmp_path):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not installed")
+    ca = _make_test_ca(tmp_path)
+    leaf = ca["leaves"][0]
+    httpd, port = _start_tls_server(leaf["cert"], leaf["key"])
+    try:
+        # No ca_file: only system roots are trusted, and this CA isn't one.
+        engine = RemoteEngine({"base_url": f"https://127.0.0.1:{port}/v1", "model": "test/model"})
+        with pytest.raises(RuntimeError) as e:
+            engine.synthesize(_PRESET_SPEC, "hi", "english", None, 0.9, 24000)
+        assert f"127.0.0.1:{port}" in str(e.value)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_tls_pin_matches_serving_leaf_succeeds(tmp_path):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not installed")
+    ca = _make_test_ca(tmp_path)
+    leaf = ca["leaves"][0]
+    httpd, port = _start_tls_server(leaf["cert"], leaf["key"])
+    try:
+        engine = RemoteEngine({"base_url": f"https://127.0.0.1:{port}/v1",
+                               "model": "test/model", "ca_file": ca["ca_cert"],
+                               "pin_sha256": leaf["fingerprint"]})
+        audio = engine.synthesize(_PRESET_SPEC, "hi", "english", None, 0.9, 24000)
+        assert len(audio) > 0
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_tls_pin_mismatch_rejects_valid_cert_from_wrong_leaf(tmp_path):
+    """The MITM-with-a-valid-cert case: leaf2 is signed by the same trusted CA
+    as leaf1, so cert validation alone would pass it — the pin is what catches
+    the swap."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl not installed")
+    ca = _make_test_ca(tmp_path)
+    leaf1, leaf2 = ca["leaves"]
+    httpd, port = _start_tls_server(leaf2["cert"], leaf2["key"])
+    try:
+        engine = RemoteEngine({"base_url": f"https://127.0.0.1:{port}/v1",
+                               "model": "test/model", "ca_file": ca["ca_cert"],
+                               "pin_sha256": leaf1["fingerprint"]})
+        with pytest.raises(RuntimeError) as e:
+            engine.synthesize(_PRESET_SPEC, "hi", "english", None, 0.9, 24000)
+        assert "not pinned" in str(e.value)
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 # ── framing: probe vs truncation ──────────────────────────────────
 
 class _FakeSock:
-    """Serves a scripted byte stream, then behaves like a closed peer."""
+    """Serves a scripted byte stream, then behaves like a closed peer. Also
+    records everything sent back, for tests that need to inspect the
+    response `handle_client` writes."""
 
     def __init__(self, data=b""):
         self._data = data
+        self.sent = b""
 
     def recv(self, n):
         if not self._data:
@@ -489,9 +877,25 @@ class _FakeSock:
         chunk, self._data = self._data[:n], self._data[n:]
         return chunk
 
+    def sendall(self, data):
+        self.sent += data
+
+    def close(self):
+        pass
+
 
 def _daemon(tmp_path):
     return relaytts_daemon.RelayTTSDaemon(_make_config(str(tmp_path)))
+
+
+def _framed(obj) -> bytes:
+    data = json.dumps(obj).encode("utf-8")
+    return struct.pack("!I", len(data)) + data
+
+
+def _decode_response(sent: bytes) -> dict:
+    length = struct.unpack("!I", sent[:4])[0]
+    return json.loads(sent[4:4 + length].decode("utf-8"))
 
 
 def test_probe_disconnect_is_not_an_error(tmp_path):
@@ -525,6 +929,211 @@ def test_header_only_close_is_truncation_not_probe(tmp_path):
         pass
     else:
         raise AssertionError("expected ConnectionError")
+
+
+def test_frame_over_max_size_rejected(tmp_path):
+    huge = relaytts_daemon.MAX_FRAME_BYTES + 1
+    try:
+        _daemon(tmp_path)._recv_request(_FakeSock(struct.pack(">I", huge)))
+    except ValueError as e:
+        assert "Payload too large" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_raw_json_framing_is_a_clear_error(tmp_path):
+    try:
+        _daemon(tmp_path)._recv_request(_FakeSock(b'{"text": "hi"}'))
+    except ValueError as e:
+        assert "raw JSON framing is not supported" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+# ── clamp_factor ─────────────────────────────────────────────────
+
+def test_clamp_factor_none_passthrough():
+    assert relaytts_daemon.clamp_factor(None, 0.25, 4.0, "speed") is None
+
+
+def test_clamp_factor_clamps_both_ends():
+    assert relaytts_daemon.clamp_factor(-1, 0.25, 4.0, "speed") == 0.25
+    assert relaytts_daemon.clamp_factor(100, 0.25, 4.0, "speed") == 4.0
+    assert relaytts_daemon.clamp_factor(1.5, 0.25, 4.0, "speed") == 1.5
+
+
+def test_clamp_factor_rejects_bool():
+    try:
+        relaytts_daemon.clamp_factor(True, 0.0, 4.0, "gain")
+    except ValueError as e:
+        assert "gain must be a number" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_clamp_factor_rejects_non_numeric():
+    try:
+        relaytts_daemon.clamp_factor("fast", 0.25, 4.0, "speed")
+    except ValueError as e:
+        assert "speed must be a number" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_clamp_factor_rejects_nan_and_infinity():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        try:
+            relaytts_daemon.clamp_factor(bad, 0.25, 4.0, "speed")
+        except ValueError as e:
+            assert "finite" in str(e)
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+# ── synthesize()-level bounds (the crash fix) ───────────────────────
+
+def _remote_daemon(tmp_path, monkeypatch):
+    """A daemon whose remote engine is stubbed to return a short clip, so
+    synthesize() runs its full text/speed/gain validation without a real
+    upstream call."""
+    daemon = _daemon(tmp_path)
+    monkeypatch.setattr(daemon.engine, "synthesize",
+                        lambda *a, **k: np.zeros(2400, dtype=np.float32))
+    return daemon
+
+
+def test_synthesize_clamps_negative_speed_instead_of_hanging(tmp_path, monkeypatch):
+    daemon = _remote_daemon(tmp_path, monkeypatch)
+    seen = {}
+    real_stretch = relaytts_daemon.time_stretch
+
+    def spy_stretch(audio, sr, speed):
+        seen["speed"] = speed
+        return real_stretch(audio, sr, speed)
+
+    monkeypatch.setattr(relaytts_daemon, "time_stretch", spy_stretch)
+
+    wav_bytes, timing = daemon.synthesize("Hello.", speed=-1)
+    assert wav_bytes
+    assert seen["speed"] == relaytts_daemon.SPEED_RANGE[0]
+
+
+def test_synthesize_rejects_infinite_speed_instead_of_hanging(tmp_path, monkeypatch):
+    daemon = _remote_daemon(tmp_path, monkeypatch)
+    try:
+        daemon.synthesize("Hello.", speed=json.loads("Infinity"))
+    except ValueError as e:
+        assert "finite" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_synthesize_clamps_gain(tmp_path, monkeypatch):
+    daemon = _remote_daemon(tmp_path, monkeypatch)
+    wav_bytes, timing = daemon.synthesize("Hello.", gain=999)
+    assert wav_bytes  # clipped, not rejected or hung
+
+
+def test_synthesize_rejects_non_string_text(tmp_path):
+    try:
+        _daemon(tmp_path).synthesize(12345)
+    except ValueError as e:
+        assert "text must be a string" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_synthesize_rejects_text_too_long(tmp_path):
+    try:
+        _daemon(tmp_path).synthesize("x" * (relaytts_daemon.MAX_TEXT_CHARS + 1))
+    except ValueError as e:
+        assert "text too long" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_time_stretch_rejects_bad_speed_on_its_own():
+    for bad in (0, -1, float("inf"), float("nan")):
+        try:
+            relaytts_daemon.time_stretch(np.zeros(10, dtype=np.float32), 24000, bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for speed={bad!r}")
+
+
+# ── batch bounds ─────────────────────────────────────────────────
+
+def test_batch_not_a_list_returns_error(tmp_path):
+    daemon = _daemon(tmp_path)
+    sock = _FakeSock(_framed({"batch": "not-a-list"}))
+    daemon.handle_client(sock, ("127.0.0.1", 0))
+    assert _decode_response(sock.sent) == {"success": False, "error": "batch must be a list"}
+
+
+def test_batch_too_many_items_returns_error(tmp_path):
+    daemon = _daemon(tmp_path)
+    batch = [{"text": "hi"}] * (relaytts_daemon.MAX_BATCH_ITEMS + 1)
+    sock = _FakeSock(_framed({"batch": batch}))
+    daemon.handle_client(sock, ("127.0.0.1", 0))
+    resp = _decode_response(sock.sent)
+    assert resp["success"] is False
+    assert "batch too large" in resp["error"]
+
+
+# ── stale bridge dir sweep ───────────────────────────────────────
+
+def test_sweep_stale_bridge_dirs_removes_dead_and_keeps_live(monkeypatch):
+    import tempfile as _tempfile
+
+    # pytest's tmp_path is too deep for an AF_UNIX socket path (~104 byte
+    # limit on macOS), so this needs its own short-lived base under /tmp.
+    base = _tempfile.mkdtemp(prefix="rtts-sweep-")
+    monkeypatch.setattr(relay_bridge.tempfile, "gettempdir", lambda: base)
+
+    dead_dir = os.path.join(base, "relaytts-bridge-dead")
+    os.mkdir(dead_dir)  # no internal.sock -> connect fails -> removed
+
+    live_dir = os.path.join(base, "relaytts-bridge-live")
+    os.mkdir(live_dir)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(os.path.join(live_dir, "internal.sock"))
+    srv.listen(1)
+    try:
+        relay_bridge._sweep_stale_bridge_dirs()
+        assert not os.path.isdir(dead_dir)
+        assert os.path.isdir(live_dir)
+    finally:
+        srv.close()
+        shutil.rmtree(base, ignore_errors=True)
+
+
+# ── ffmpeg via pipes ─────────────────────────────────────────────
+
+def _sine(seconds, sr, hz=440.0):
+    t = np.linspace(0, seconds, int(sr * seconds), endpoint=False)
+    return (0.3 * np.sin(2 * np.pi * hz * t)).astype(np.float32)
+
+
+def test_time_stretch_changes_length_by_speed():
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+    sr = 24000
+    audio = _sine(0.2, sr)
+    speed = 1.5
+    out = relaytts_daemon.time_stretch(audio, sr, speed)
+    expected = len(audio) / speed
+    assert abs(len(out) - expected) / expected < 0.05
+
+
+def test_resample_changes_length_by_ratio():
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not installed")
+    sr, target_sr = 24000, 16000
+    audio = _sine(0.2, sr)
+    out = relaytts_daemon.resample(audio, sr, target_sr)
+    expected = len(audio) * target_sr / sr
+    assert abs(len(out) - expected) / expected < 0.05
 
 
 if __name__ == "__main__":

@@ -20,45 +20,51 @@ if [ -x "$RELAY" ]; then
         echo "kokoro-daemon unregistered"
     fi
 
-    # Remote inference is a deployment choice, not a source change: export
-    # RELAYTTS_REMOTE_URL before running this and it is baked into the service
-    # registration, so the daemon comes up in remote mode and loads no model.
-    #
-    #   RELAYTTS_REMOTE_URL=http://<router>:<port>/v1 \\
-    #   RELAYTTS_REMOTE_MODEL=<id-that-server-exposes> ./build.sh
-    #
-    REGISTER_ENV=()
-    if [ -n "${RELAYTTS_REMOTE_URL:-}" ]; then
-        REGISTER_ENV+=(--env "RELAYTTS_REMOTE_URL=$RELAYTTS_REMOTE_URL")
-    fi
-    if [ -n "${RELAYTTS_REMOTE_MODEL:-}" ]; then
-        REGISTER_ENV+=(--env "RELAYTTS_REMOTE_MODEL=$RELAYTTS_REMOTE_MODEL")
-    fi
-    if [ -n "${RELAYTTS_REMOTE_CLONE_MODEL:-}" ]; then
-        REGISTER_ENV+=(--env "RELAYTTS_REMOTE_CLONE_MODEL=$RELAYTTS_REMOTE_CLONE_MODEL")
-    fi
-
     if "$RELAY" service list 2>/dev/null | grep -q "relaytts-daemon"; then
         echo "Already registered with Relay. Daemon will use updated scripts."
         # `service register` is the only way to set env; there is no update
         # verb. So say so rather than silently ignoring a changed URL.
-        if [ ${#REGISTER_ENV[@]} -gt 0 ]; then
-            echo "NOTE: RELAYTTS_REMOTE_URL is set but the service is already" \
-                 "registered. To change it, unregister first:"
+        if [ -n "${RELAYTTS_REMOTE_URL:-}" ] || [ -n "${RELAYTTS_REMOTE_MODEL:-}" ]; then
+            echo "NOTE: a RELAYTTS_REMOTE_* variable is set but the service is" \
+                 "already registered. To change it, unregister first:"
             echo "      $RELAY service unregister --name relaytts-daemon && ./build.sh"
         fi
     else
+        # The daemon owns no model — RELAYTTS_REMOTE_URL / RELAYTTS_REMOTE_MODEL
+        # are the deployment facts that point it at the server that does, and
+        # `service register` is the only chance to bake them in. Fail loudly
+        # here rather than register a daemon that will 500 on every request.
+        MISSING=()
+        [ -z "${RELAYTTS_REMOTE_URL:-}" ] && MISSING+=("RELAYTTS_REMOTE_URL")
+        [ -z "${RELAYTTS_REMOTE_MODEL:-}" ] && MISSING+=("RELAYTTS_REMOTE_MODEL")
+        if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "Missing required env var(s) for registration: ${MISSING[*]}" >&2
+            echo "  RELAYTTS_REMOTE_URL=https://<host>:<port>/v1 \\" >&2
+            echo "  RELAYTTS_REMOTE_MODEL=<id-that-server-exposes> ./build.sh" >&2
+            exit 1
+        fi
+
+        REGISTER_ENV=(
+            --env "RELAYTTS_REMOTE_URL=$RELAYTTS_REMOTE_URL"
+            --env "RELAYTTS_REMOTE_MODEL=$RELAYTTS_REMOTE_MODEL"
+        )
+        if [ -n "${RELAYTTS_REMOTE_CLONE_MODEL:-}" ]; then
+            REGISTER_ENV+=(--env "RELAYTTS_REMOTE_CLONE_MODEL=$RELAYTTS_REMOTE_CLONE_MODEL")
+        fi
+        if [ -n "${RELAYTTS_REMOTE_CA:-}" ]; then
+            REGISTER_ENV+=(--env "RELAYTTS_REMOTE_CA=$RELAYTTS_REMOTE_CA")
+        fi
+        if [ -n "${RELAYTTS_REMOTE_PIN_SHA256:-}" ]; then
+            REGISTER_ENV+=(--env "RELAYTTS_REMOTE_PIN_SHA256=$RELAYTTS_REMOTE_PIN_SHA256")
+        fi
+
         "$RELAY" service register \
             --name relaytts-daemon \
             --command "$SCRIPT_DIR/daemon/daemon_wrapper.sh" \
             --autostart \
             --no-frontend-creds \
-            "${REGISTER_ENV[@]+"${REGISTER_ENV[@]}"}"
-        if [ ${#REGISTER_ENV[@]} -gt 0 ]; then
-            echo "Registered relaytts-daemon service with Relay (remote: $RELAYTTS_REMOTE_URL)"
-        else
-            echo "Registered relaytts-daemon service with Relay (local model)"
-        fi
+            "${REGISTER_ENV[@]}"
+        echo "Registered relaytts-daemon service with Relay (remote: $RELAYTTS_REMOTE_URL)"
     fi
 else
     echo "Relay not found at $RELAY, skipping registration"
