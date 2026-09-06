@@ -1,20 +1,26 @@
-# Top-level runtime dependencies for the relayTTS daemon — intent, not the lock.
+# Runtime dependencies for the relayTTS daemon — intent, not the lock.
 #
-# Edit this file to change a dependency, then regenerate the hash-pinned lockfile:
+# The daemon never loads a model: synthesis is an HTTP call to a remote server
+# that holds the weights. MLX and mlx-audio have no place here — the daemon
+# has no local-inference mode to fall back to.
+#
+# HTTP goes through urllib from the standard library, so there is no client
+# dependency here either.
+#
+# Regenerate the hash-pinned lockfile after editing:
 #
 #   pip-compile --generate-hashes --allow-unsafe --output-file requirements.txt requirements.in
 #
-# After recompiling, re-run the concurrency smoke test before committing the new lockfile.
+# COMPILE THIS WITH PYTHON 3.11 — the version setup_env.sh builds the env with.
+# pip-compile resolves against the interpreter running it, so compiling on a
+# newer Python silently pins wheels that 3.11 cannot install, and the failure
+# only shows up on a fresh deployment:
 #
-# NOTE: espeak-ng, misaki, phonemizer, spacy, and num2words are intentionally
-# NOT listed here. Those are Kokoro G2P dependencies — Qwen3-TTS has no
-# phonemizer step and speaks directly from raw text.
+#   ERROR: Could not find a version that satisfies the requirement numpy==2.5.2
 #
-# ffmpeg (brew install ffmpeg) is required at runtime for pitch-preserving
-# time-stretch but is a system binary, not a pip package.
+# ffmpeg (brew install ffmpeg) is still required at runtime, for the
+# pitch-preserving time-stretch applied to any speed != 1.0.
 
-mlx-audio>=0.4.4    # Qwen3-TTS / qwen3_tts model support landed in 0.4.4; Apple Silicon MLX
-mlx                  # MLX core (pulled transitively by mlx-audio; listed explicitly for clarity)
-soundfile            # WAV encoding / decoding
+soundfile            # decode the WAV the remote server returns; encode the reply
 numpy
 pyyaml               # the daemon reads config.yaml for voice definitions at startup

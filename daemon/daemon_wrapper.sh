@@ -8,18 +8,17 @@ source "${CONDA_BASE}/bin/activate" relaytts
 # Directory of this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Line-buffer the daemon's stdout/stderr so operational logs (model load, bridge
+# Line-buffer the daemon's stdout/stderr so operational logs (bridge
 # registration, custom-voice reloads) reach Relay's logfile promptly instead of
 # sitting in a block buffer while the long-lived process runs.
 export PYTHONUNBUFFERED=1
 
 # Restart-on-crash supervision.
 #
-# The daemon wraps non-thread-safe native libs (MLX/Metal), which it drives from
-# a single dedicated generation thread so concurrent requests can't crash it,
-# but if the process ever still dies (OOM, an unrelated native fault) we restart
-# it so
-# TTS self-heals instead of staying dead until the next Relay launch — the
+# The daemon owns no model — no native library for a generation thread to
+# protect — but it can still die (an OOM under load, an ffmpeg subprocess
+# fault propagating up, an unhandled exception in the accept loop). Restart it
+# so TTS self-heals instead of staying dead until the next Relay launch — the
 # daemon is registered --autostart only, with no restart-on-crash from Relay.
 #
 # Relay runs this wrapper as a process-group leader and stops the service by
