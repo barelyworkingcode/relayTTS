@@ -25,11 +25,34 @@ Relay control plane ──Unix socket (bridge)──► relay_bridge.py  (status
   the transport `RemoteEngine` uses. Pure functions plus one urllib opener
   builder; no state of its own.
 - `daemon/relay_bridge.py` — optional "enhanced service" surface for Relay's
-  settings UI (status endpoint + live voices.json editing). A no-op unless Relay
-  injects `RELAY_BRIDGE_SOCKET` / `RELAY_SERVICE_ID` / `RELAY_SERVICE_TOKEN`. The
-  Eve-facing TTS protocol on 9997 is independent of this and always works.
+  settings UI (status + voices.json editor), plus the relay launch-identity
+  handshake. A no-op unless Relay launched the daemon (`RELAY_LAUNCH_FD` set).
+  The Eve-facing TTS protocol on 9997 is independent of this and always works.
 - `daemon/daemon_wrapper.sh` — conda-env wrapper + restart-on-crash supervisor;
   the command Relay autostarts (`--idle-timeout 0`).
+
+## Relay launch identity
+
+No relay credential is ever in the daemon's environment or argv (any
+same-user process can read both on macOS). Relay launches the service with
+`RELAY_BRIDGE_SOCKET`, `RELAY_SERVICE_ID` and `RELAY_LAUNCH_FD=3`; fd 3 is a
+pipe holding a single-use 64-lowercase-hex launch secret. The contract is
+`../spec-launch-identity.md`.
+
+- First thing in `main()`, before config loading or anything that can spawn,
+  `establish_launch_identity()` removes `RELAY_LAUNCH_FD` from `os.environ`,
+  drains and closes the fd, validates the secret, and sends
+  `{"type":"Hello","name":<service id>,"token":<secret>}` on the bridge.
+  Relay answers `{"type":"OK","data":{"service_id","relay_pid"}}` and binds
+  this process's kernel audit token as the service identity.
+- Any failure while `RELAY_LAUNCH_FD` is set exits 78. The wrapper does not
+  respawn on 78: the secret is spent, so a respawn could never re-bind.
+- Every later bridge request (`RegisterManifest`) carries no `token`; relay
+  authenticates it by peer audit token. Only the python process holding the
+  identity may talk to the bridge — not the wrapper, not ffmpeg.
+- The internal bearer for relay → daemon status calls is generated in-process
+  and handed over in `RegisterManifest`; it never touches the environment.
+- `RELAY_LAUNCH_FD` unset = standalone: no Hello, no bridge, inspector off.
 - `config.yaml` — dev-owned static config: engine params, built-in voices,
   per-voice `instruct`, legacy Kokoro alias map. Tracked in git.
 - `voices.json` — runtime, user-defined custom voices and clones. Edited live by

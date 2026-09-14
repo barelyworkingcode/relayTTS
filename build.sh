@@ -62,7 +62,7 @@ if [ -x "$RELAY" ]; then
             --name relaytts-daemon \
             --command "$SCRIPT_DIR/daemon/daemon_wrapper.sh" \
             --autostart \
-            --no-frontend-creds \
+            --capability manifest \
             "${REGISTER_ENV[@]}"
         echo "Registered relaytts-daemon service with Relay (remote: $RELAYTTS_REMOTE_URL)"
     fi

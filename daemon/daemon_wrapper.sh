@@ -26,6 +26,12 @@ export PYTHONUNBUFFERED=1
 # background, wait on it, and trap TERM/INT to forward the signal, stop the loop,
 # and exit promptly — well inside Relay's grace window. Only an unexpected exit
 # (crash) triggers a respawn; a clean exit or a stop signal ends the loop.
+#
+# fd 3 (relay's launch pipe) is deliberately left untouched so python inherits
+# it. Exit 78 is the daemon refusing to run without its relay launch identity;
+# a respawn could never succeed (the launch secret is single-use and already
+# drained), so it ends the loop and relay sees the launch end.
+EX_NO_LAUNCH_IDENTITY=78
 term=0
 child=""
 shutdown() { term=1; [ -n "$child" ] && kill -TERM "$child" 2>/dev/null; }
@@ -36,6 +42,9 @@ while true; do
     child=$!
     wait "$child"
     code=$?
+    if [ "$code" -eq "$EX_NO_LAUNCH_IDENTITY" ]; then
+        exit "$code"
+    fi
     if [ "$term" -eq 1 ] || [ "$code" -eq 0 ]; then
         break
     fi

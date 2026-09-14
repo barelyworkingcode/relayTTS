@@ -163,7 +163,7 @@ relayTTS/
 └── daemon/
     ├── relaytts_daemon.py     # TCP server, voice registry, RemoteEngine, WAV post-processing
     ├── pinned_transport.py    # Fail-closed TLS + certificate pinning for RemoteEngine
-    ├── relay_bridge.py        # Relay settings-UI bridge (status + voices.json editor)
+    ├── relay_bridge.py        # Relay launch-identity Hello + settings-UI bridge (status + voices.json editor)
     ├── daemon_wrapper.sh      # Conda wrapper + restart-on-crash supervisor
     └── test_relaytts.py       # pytest suite
 ```
