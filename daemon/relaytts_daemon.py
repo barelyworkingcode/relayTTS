@@ -20,6 +20,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -508,8 +509,10 @@ class RemoteEngine:
 # ── Daemon ────────────────────────────────────────────────────────
 
 class RelayTTSDaemon:
-    def __init__(self, config: Config, host="localhost", port=9997, idle_timeout=0):
+    def __init__(self, config: Config, host="localhost", port=9997, idle_timeout=0,
+                 relay_identity_bound=False):
         self.cfg = config
+        self.relay_identity_bound = relay_identity_bound
         self.host = host
         self.port = port
         self.engine = config.remote
@@ -881,9 +884,10 @@ class RelayTTSDaemon:
             config_path=self.cfg.custom_voices_path,
             speakers=self.cfg.speakers,
             clone_audio_dir=self.cfg.clone_audio_dir,
+            identity_bound=self.relay_identity_bound,
         )
         if not bridge.enabled:
-            print("Standalone mode (no RELAY_BRIDGE_SOCKET); settings inspector disabled")
+            print("Standalone mode (no RELAY_LAUNCH_FD); settings inspector disabled")
             return
         try:
             bridge.start()
@@ -926,7 +930,24 @@ class RelayTTSDaemon:
             time.sleep(1.5)
 
 
+def establish_relay_identity() -> bool:
+    """Fail closed: once relay has launched us, the daemon never runs without
+    the identity relay believes it has."""
+    from relay_bridge import LaunchIdentityError, establish_launch_identity
+    try:
+        bound = establish_launch_identity()
+    except LaunchIdentityError as e:
+        print(f"relay launch identity failed: {e}", file=sys.stderr)
+        sys.exit(78)
+    if bound:
+        print("Relay launch identity established")
+    return bound
+
+
 def main():
+    # Deliberate: first, before argument parsing or config loading, so the
+    # launch pipe is drained and closed before anything could spawn a child.
+    relay_identity_bound = establish_relay_identity()
     parser = argparse.ArgumentParser(description="relayTTS Daemon (Qwen3-TTS)")
     parser.add_argument("--host", default="localhost")
     parser.add_argument("--port", type=int, default=9997)
@@ -943,7 +964,8 @@ def main():
     counts = config.voice_counts()
     print(f"Loaded config: {args.config} ({counts['builtin']} built-in + "
           f"{counts['custom']} custom voices, default={config.default_voice})")
-    daemon = RelayTTSDaemon(config, host=args.host, port=args.port, idle_timeout=args.idle_timeout)
+    daemon = RelayTTSDaemon(config, host=args.host, port=args.port, idle_timeout=args.idle_timeout,
+                            relay_identity_bound=relay_identity_bound)
     daemon.start()
 
 

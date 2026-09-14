@@ -1,23 +1,28 @@
 #!/usr/bin/env python3
 """relayTTS ↔ Relay enhanced-service bridge (the "service inspector" integration).
 
-When relay spawns the daemon it injects RELAY_BRIDGE_SOCKET / RELAY_SERVICE_ID /
-RELAY_SERVICE_TOKEN. Their presence means *enhanced mode*: the daemon binds a
-private internal Unix socket, serves a tiny HTTP `/api/status` on it, and
-registers a manifest over the bridge so relay's settings UI can show status and
-edit the custom-voice palette (voices.json). Absent those vars (a standalone run
-or a unit test) every entry point here is a no-op.
+When relay launches the daemon it sets RELAY_BRIDGE_SOCKET / RELAY_SERVICE_ID /
+RELAY_LAUNCH_FD and hands a one-shot launch secret over an inherited pipe (fd
+3). No relay credential is ever in the environment. At startup the daemon
+drains that pipe and presents the secret in a `Hello` on the bridge socket;
+relay binds this process's kernel audit token as the service's identity, and
+every later bridge request from this process carries no token at all.
 
-This is a Python port of the contract relayLLM gets for free from relay's Go
-`bridge` package (see relay/cmd/testservice/main.go, relay/bridge/*.go,
-relay/docs/service-manifest.md):
+With an identity bound, the daemon binds a private internal Unix socket, serves
+a tiny HTTP `/api/status` on it, and registers a manifest over the bridge so
+relay's settings UI can show status and edit the custom-voice palette
+(voices.json). Without RELAY_LAUNCH_FD (a standalone run or a unit test) every
+entry point here is a no-op.
+
+This is a Python port of the contract relayLLM gets from relay's Go `bridge`
+package (see relay/docs/service-manifest.md, relay/docs/tokens.md):
 
   * Wire: newline-delimited JSON over the bridge Unix socket. Send one
-    BridgeRequest{type:"RegisterManifest", arguments:RegisterManifestRequest,
-    token}; read one BridgeResponse line; type=="Error" means failure.
+    BridgeRequest; read one BridgeResponse line; type=="Error" means failure.
+  * Identity: bound to the process that sent Hello, not to a connection, so a
+    request on any later connection from this process is authenticated.
   * Liveness: relay tracks a manifest by the SERVICE PROCESS, not this
-    connection (service_registry Forgets on exit), so we register once and
-    close — no need to hold the bridge socket open.
+    connection, so we register once and close.
   * Internal socket: relay polls status.path and dispatches front-door routes to
     it, sending `Authorization: Bearer <internalToken>`. The token + socket are
     service-chosen and declared in the registration.
@@ -28,6 +33,7 @@ unrelated — this module only adds the relay control-plane surface.
 import hmac
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -36,13 +42,124 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler
 
-# Env-var ABI relay injects at spawn (relay/bridge/types.go).
+# Env-var ABI relay sets at launch. None of these is secret.
 ENV_BRIDGE_SOCKET = "RELAY_BRIDGE_SOCKET"
 ENV_SERVICE_ID = "RELAY_SERVICE_ID"
-ENV_SERVICE_TOKEN = "RELAY_SERVICE_TOKEN"
-ENV_SERVICE_TOKEN_LEGACY = "RELAY_MCP_TOKEN"  # transition fallback
+ENV_LAUNCH_FD = "RELAY_LAUNCH_FD"
 
 _MAX_LINE = 10 * 1024 * 1024  # mirrors bridge.MaxMessageSize
+_LAUNCH_SECRET_RE = re.compile(r"[0-9a-f]{64}")
+# A well-formed secret is 64 bytes; anything past this is malformed, so the
+# read stops rather than buffering whatever an unexpected fd produces.
+_LAUNCH_SECRET_READ_CAP = 4096
+_HELLO_TIMEOUT_S = 5.0
+
+
+class LaunchIdentityError(RuntimeError):
+    """Relay launched us but the launch identity could not be established.
+    Messages never contain the secret."""
+
+
+def _read_line(c: socket.socket) -> str:
+    buf = b""
+    while b"\n" not in buf and len(buf) < _MAX_LINE:
+        chunk = c.recv(65536)
+        if not chunk:
+            break
+        buf += chunk
+    return buf.split(b"\n", 1)[0].decode("utf-8", "replace")
+
+
+# ── Launch identity (fd 3 secret + Hello) ─────────────────────────
+
+def read_launch_secret(fd: int) -> str:
+    """Drain `fd` to EOF, close it, and return the 64-lowercase-hex secret."""
+    data = b""
+    try:
+        while len(data) <= _LAUNCH_SECRET_READ_CAP:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break
+            data += chunk
+    except OSError as e:
+        raise LaunchIdentityError(f"cannot read launch fd {fd}: {e.strerror}") from None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        secret = data.decode("ascii")
+    except UnicodeDecodeError:
+        secret = ""
+    if not _LAUNCH_SECRET_RE.fullmatch(secret):
+        raise LaunchIdentityError(
+            f"launch secret malformed ({len(data)} bytes; want 64 lowercase hex)")
+    return secret
+
+
+def build_hello_payload(service_id: str, secret: str) -> bytes:
+    return json.dumps({"type": "Hello", "name": service_id,
+                       "token": secret}).encode("utf-8") + b"\n"
+
+
+def send_hello(bridge_sock: str, service_id: str, secret: str,
+               timeout: float = _HELLO_TIMEOUT_S) -> dict:
+    """Present the launch secret; return the OK frame's `data` on success."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(timeout)
+            c.connect(bridge_sock)
+            c.sendall(build_hello_payload(service_id, secret))
+            line = _read_line(c)
+    except OSError as e:
+        raise LaunchIdentityError(f"Hello transport failure: {e.__class__.__name__}") from None
+    if not line:
+        raise LaunchIdentityError("bridge closed without answering Hello")
+    try:
+        resp = json.loads(line)
+    except ValueError:
+        resp = None
+    if not isinstance(resp, dict):
+        raise LaunchIdentityError("malformed Hello response")
+    if resp.get("type") == "Error":
+        raise LaunchIdentityError(
+            f"Hello refused: code {resp.get('code')}: {resp.get('message')}")
+    data = resp.get("data")
+    if (resp.get("type") != "OK" or not isinstance(data, dict)
+            or data.get("service_id") != service_id
+            or not isinstance(data.get("relay_pid"), int)):
+        raise LaunchIdentityError("malformed Hello response")
+    return data
+
+
+def establish_launch_identity(environ=os.environ) -> bool:
+    """Run the launch handshake if relay launched us.
+
+    Returns False when RELAY_LAUNCH_FD is unset (standalone), True once relay
+    has bound this process's identity, and raises LaunchIdentityError on any
+    failure in between. Must run before the daemon spawns any child.
+    """
+    raw_fd = environ.get(ENV_LAUNCH_FD)
+    if raw_fd is None:
+        return False
+    # Deliberate: removed before anything else can fail, so no child spawned
+    # later (ffmpeg) inherits a pointer to a launch pipe.
+    del environ[ENV_LAUNCH_FD]
+    try:
+        fd = int(raw_fd)
+    except ValueError:
+        fd = -1
+    if fd < 0:
+        raise LaunchIdentityError(f"{ENV_LAUNCH_FD} is not a file descriptor")
+    secret = read_launch_secret(fd)
+    bridge_sock = environ.get(ENV_BRIDGE_SOCKET, "")
+    service_id = environ.get(ENV_SERVICE_ID, "")
+    if not bridge_sock or not service_id:
+        raise LaunchIdentityError(
+            f"{ENV_LAUNCH_FD} is set but {ENV_BRIDGE_SOCKET} or {ENV_SERVICE_ID} is empty")
+    send_hello(bridge_sock, service_id, secret)
+    return True
 
 
 # ── Manifest building (pure — unit-tested without any socket) ──────
@@ -157,8 +274,11 @@ def build_manifest(service_id: str, config_path: str, speakers: list,
 
 
 def build_register_payload(service_id: str, manifest: dict, internal_socket: str,
-                           internal_token: str, token: str) -> bytes:
-    """The exact newline-terminated BridgeRequest bytes sent to the bridge."""
+                           internal_token: str) -> bytes:
+    """The exact newline-terminated BridgeRequest bytes sent to the bridge.
+
+    Deliberately carries no `token`: relay authenticates this request by the
+    peer audit token bound at Hello."""
     req = {
         "type": "RegisterManifest",
         "arguments": {
@@ -167,7 +287,6 @@ def build_register_payload(service_id: str, manifest: dict, internal_socket: str
             "internalSocket": internal_socket,
             "internalToken": internal_token,
         },
-        "token": token,
     }
     return json.dumps(req).encode("utf-8") + b"\n"
 
@@ -264,16 +383,16 @@ def _sweep_stale_bridge_dirs():
 class RelayBridge:
     """Enhanced-service registration + internal status server.
 
-    Construct it always; check `.enabled` (true only when relay spawned us). All
+    Construct it always; check `.enabled` (true only once relay has bound this
+    process's launch identity, see `establish_launch_identity`). All
     failures in `start()` raise so the caller can keep them non-fatal — the TTS
     daemon must serve Eve on 9997 even if the inspector never comes up."""
 
     def __init__(self, status_provider, config_path: str, speakers: list,
-                 clone_audio_dir: str, service_id: str = None):
+                 clone_audio_dir: str, identity_bound: bool, service_id: str = None):
         self.bridge_sock = os.environ.get(ENV_BRIDGE_SOCKET, "")
         self.service_id = service_id or os.environ.get(ENV_SERVICE_ID, "")
-        self.token = (os.environ.get(ENV_SERVICE_TOKEN)
-                      or os.environ.get(ENV_SERVICE_TOKEN_LEGACY) or "")
+        self.identity_bound = identity_bound
         self.status_provider = status_provider
         self.config_path = config_path
         self.speakers = list(speakers)
@@ -286,11 +405,11 @@ class RelayBridge:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.bridge_sock and self.service_id and self.token)
+        return bool(self.bridge_sock and self.service_id and self.identity_bound)
 
     def start(self):
         if not self.enabled:
-            raise RuntimeError("relay bridge env not present (standalone mode)")
+            raise RuntimeError("no relay launch identity (standalone mode)")
         _sweep_stale_bridge_dirs()
         self._dir = tempfile.mkdtemp(prefix="relaytts-bridge-")
         self.internal_sock = os.path.join(self._dir, "internal.sock")
@@ -306,28 +425,17 @@ class RelayBridge:
         manifest = build_manifest(self.service_id, self.config_path, self.speakers,
                                   self.clone_audio_dir)
         payload = build_register_payload(self.service_id, manifest,
-                                         self.internal_sock, self.internal_token,
-                                         self.token)
+                                         self.internal_sock, self.internal_token)
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
             c.settimeout(5.0)
             c.connect(self.bridge_sock)
             c.sendall(payload)
-            line = self._read_line(c)
+            line = _read_line(c)
         if not line:
             raise RuntimeError("bridge closed without a response")
         resp = json.loads(line)
         if resp.get("type") == "Error":
             raise RuntimeError(f"bridge error {resp.get('code')}: {resp.get('message')}")
-
-    @staticmethod
-    def _read_line(c: socket.socket) -> str:
-        buf = b""
-        while b"\n" not in buf and len(buf) < _MAX_LINE:
-            chunk = c.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
-        return buf.split(b"\n", 1)[0].decode("utf-8")
 
     def stop(self):
         if self._server is not None:

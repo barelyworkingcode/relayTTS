@@ -276,11 +276,11 @@ def test_build_manifest_shape():
 
 def test_register_payload_framing():
     m = relay_bridge.build_manifest("svc", "/abs/v.json", ["a"], "/data/clone-audio")
-    raw = relay_bridge.build_register_payload("svc", m, "/tmp/i.sock", "itok", "stok")
+    raw = relay_bridge.build_register_payload("svc", m, "/tmp/i.sock", "itok")
     assert raw.endswith(b"\n")
     msg = json.loads(raw)
     assert msg["type"] == "RegisterManifest"
-    assert msg["token"] == "stok"
+    assert "token" not in msg
     args = msg["arguments"]
     assert args["serviceId"] == "svc"
     assert args["internalSocket"] == "/tmp/i.sock"
@@ -1134,6 +1134,257 @@ def test_resample_changes_length_by_ratio():
     out = relaytts_daemon.resample(audio, sr, target_sr)
     expected = len(audio) * target_sr / sr
     assert abs(len(out) - expected) / expected < 0.05
+
+
+# ── relay launch identity (fd 3 secret + Hello) ──────────────────
+
+SECRET = "0123456789abcdef" * 4
+
+
+def _pipe_with(data: bytes) -> int:
+    r, w = os.pipe()
+    os.write(w, data)
+    os.close(w)
+    return r
+
+
+def _fd_is_closed(fd: int) -> bool:
+    try:
+        os.fstat(fd)
+    except OSError:
+        return True
+    return False
+
+
+def test_read_launch_secret_valid_and_closes_fd():
+    fd = _pipe_with(SECRET.encode())
+    assert relay_bridge.read_launch_secret(fd) == SECRET
+    assert _fd_is_closed(fd)
+
+
+def test_read_launch_secret_multiple_writes_read_to_eof():
+    r, w = os.pipe()
+    os.write(w, SECRET[:10].encode())
+    os.write(w, SECRET[10:].encode())
+    os.close(w)
+    assert relay_bridge.read_launch_secret(r) == SECRET
+
+
+def test_read_launch_secret_rejects_malformed_without_echoing():
+    bad = [SECRET + "\n", SECRET.upper(), SECRET[:63], SECRET + "0", "",
+           ("g" * 64), "a" * 5000]
+    for value in bad:
+        fd = _pipe_with(value.encode())
+        try:
+            relay_bridge.read_launch_secret(fd)
+        except relay_bridge.LaunchIdentityError as e:
+            assert SECRET not in str(e) and SECRET.upper() not in str(e)
+        else:
+            raise AssertionError(f"accepted malformed secret of length {len(value)}")
+        assert _fd_is_closed(fd)
+
+
+def test_read_launch_secret_bad_fd_fails_closed():
+    r, w = os.pipe()
+    os.close(r)
+    os.close(w)
+    try:
+        relay_bridge.read_launch_secret(r)
+    except relay_bridge.LaunchIdentityError:
+        pass
+    else:
+        raise AssertionError("closed fd accepted")
+
+
+class _FakeBridge:
+    """A real Unix-socket server that records each request line and answers
+    with `reply(request_dict)` (bytes, or None to close without answering)."""
+
+    def __init__(self, reply):
+        import tempfile as _tempfile
+        # AF_UNIX paths cap at ~104 bytes on macOS, so not pytest's tmp_path.
+        self.dir = _tempfile.mkdtemp(prefix="rtts-br-")
+        self.path = os.path.join(self.dir, "bridge.sock")
+        self.reply = reply
+        self.requests = []
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        self.srv.listen(4)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                return
+            with conn:
+                buf = b""
+                while b"\n" not in buf:
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+                req = json.loads(buf.split(b"\n", 1)[0])
+                self.requests.append(req)
+                out = self.reply(req)
+                if out is not None:
+                    conn.sendall(out)
+
+    def close(self):
+        self.srv.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def _ok(service_id="relaytts-daemon", relay_pid=4242):
+    return lambda req: json.dumps({"type": "OK", "data": {
+        "service_id": service_id, "relay_pid": relay_pid}}).encode() + b"\n"
+
+
+def _hello_raises(reply, secret=SECRET):
+    br = _FakeBridge(reply)
+    try:
+        relay_bridge.send_hello(br.path, "relaytts-daemon", secret, timeout=2.0)
+    except relay_bridge.LaunchIdentityError as e:
+        assert secret not in str(e)
+        return str(e)
+    finally:
+        br.close()
+    raise AssertionError("Hello unexpectedly succeeded")
+
+
+def test_hello_success_sends_exact_frame():
+    br = _FakeBridge(_ok())
+    try:
+        data = relay_bridge.send_hello(br.path, "relaytts-daemon", SECRET, timeout=2.0)
+    finally:
+        br.close()
+    assert data == {"service_id": "relaytts-daemon", "relay_pid": 4242}
+    assert br.requests == [{"type": "Hello", "name": "relaytts-daemon", "token": SECRET}]
+
+
+def test_hello_error_frame_fails_closed():
+    msg = _hello_raises(lambda req: b'{"type":"Error","code":-32001,"message":"unauthorized"}\n')
+    assert "-32001" in msg
+
+
+def test_hello_malformed_responses_fail_closed():
+    for reply in (
+        lambda req: b"not json\n",
+        lambda req: b"[1,2]\n",
+        lambda req: b'{"type":"OK"}\n',
+        lambda req: b'{"type":"Result","data":{"service_id":"relaytts-daemon","relay_pid":1}}\n',
+        lambda req: b'{"type":"OK","data":{"relay_pid":1}}\n',
+        lambda req: b'{"type":"OK","data":{"service_id":"relaytts-daemon","relay_pid":"1"}}\n',
+        _ok(service_id="someone-else"),
+        lambda req: None,
+    ):
+        _hello_raises(reply)
+
+
+def test_hello_unreachable_socket_fails_closed():
+    try:
+        relay_bridge.send_hello("/tmp/rtts-no-such-bridge.sock", "svc", SECRET, timeout=1.0)
+    except relay_bridge.LaunchIdentityError as e:
+        assert SECRET not in str(e)
+    else:
+        raise AssertionError("unreachable bridge accepted")
+
+
+def test_establish_unset_is_standalone():
+    assert relay_bridge.establish_launch_identity({"RELAY_BRIDGE_SOCKET": "/x"}) is False
+
+
+def test_establish_full_handshake_and_env_scrubbed():
+    br = _FakeBridge(_ok())
+    fd = _pipe_with(SECRET.encode())
+    env = {"RELAY_LAUNCH_FD": str(fd), "RELAY_BRIDGE_SOCKET": br.path,
+           "RELAY_SERVICE_ID": "relaytts-daemon"}
+    try:
+        assert relay_bridge.establish_launch_identity(env) is True
+    finally:
+        br.close()
+    assert "RELAY_LAUNCH_FD" not in env
+    assert _fd_is_closed(fd)
+    assert br.requests[0]["token"] == SECRET
+
+
+def test_establish_fails_closed_on_bad_inputs():
+    for build in (
+        lambda: {"RELAY_LAUNCH_FD": "three", "RELAY_BRIDGE_SOCKET": "/x", "RELAY_SERVICE_ID": "s"},
+        lambda: {"RELAY_LAUNCH_FD": str(_pipe_with(b"short")),
+                 "RELAY_BRIDGE_SOCKET": "/x", "RELAY_SERVICE_ID": "s"},
+        lambda: {"RELAY_LAUNCH_FD": str(_pipe_with(SECRET.encode())), "RELAY_SERVICE_ID": "s"},
+        lambda: {"RELAY_LAUNCH_FD": str(_pipe_with(SECRET.encode())),
+                 "RELAY_BRIDGE_SOCKET": "/tmp/rtts-no-such-bridge.sock", "RELAY_SERVICE_ID": "s"},
+    ):
+        env = build()
+        try:
+            relay_bridge.establish_launch_identity(env)
+        except relay_bridge.LaunchIdentityError as e:
+            assert SECRET not in str(e)
+            assert "RELAY_LAUNCH_FD" not in env
+        else:
+            raise AssertionError(f"accepted {sorted(env)}")
+
+
+def test_child_inherits_neither_launch_fd_nor_var(monkeypatch):
+    br = _FakeBridge(_ok())
+    fd = _pipe_with(SECRET.encode())
+    monkeypatch.setenv("RELAY_LAUNCH_FD", str(fd))
+    monkeypatch.setenv("RELAY_BRIDGE_SOCKET", br.path)
+    monkeypatch.setenv("RELAY_SERVICE_ID", "relaytts-daemon")
+    try:
+        assert relay_bridge.establish_launch_identity() is True
+    finally:
+        br.close()
+    probe = ("import os, sys\n"
+             f"try:\n    os.fstat({fd}); print('fd-open')\n"
+             "except OSError:\n    print('fd-closed')\n"
+             "print(os.environ.get('RELAY_LAUNCH_FD', 'unset'))\n")
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True,
+                         text=True, check=True).stdout.split()
+    assert out == ["fd-closed", "unset"]
+
+
+def test_daemon_exits_nonzero_when_identity_fails(monkeypatch):
+    fd = _pipe_with(b"not-a-secret")
+    monkeypatch.setenv("RELAY_LAUNCH_FD", str(fd))
+    monkeypatch.setenv("RELAY_BRIDGE_SOCKET", "/tmp/rtts-no-such-bridge.sock")
+    monkeypatch.setenv("RELAY_SERVICE_ID", "relaytts-daemon")
+    try:
+        relaytts_daemon.establish_relay_identity()
+    except SystemExit as e:
+        assert e.code == 78
+    else:
+        raise AssertionError("daemon continued without its launch identity")
+
+
+def test_bridge_disabled_without_bound_identity(monkeypatch):
+    monkeypatch.setenv("RELAY_BRIDGE_SOCKET", "/tmp/whatever.sock")
+    monkeypatch.setenv("RELAY_SERVICE_ID", "relaytts-daemon")
+    b = relay_bridge.RelayBridge(lambda: {}, "/abs/v.json", ["a"], "/data/c",
+                                 identity_bound=False)
+    assert not b.enabled
+
+
+def test_register_manifest_on_the_wire_carries_no_token(monkeypatch):
+    br = _FakeBridge(lambda req: b'{"type":"OK"}\n')
+    monkeypatch.setenv("RELAY_BRIDGE_SOCKET", br.path)
+    monkeypatch.setenv("RELAY_SERVICE_ID", "relaytts-daemon")
+    b = relay_bridge.RelayBridge(lambda: {}, "/abs/v.json", ["a"], "/data/c",
+                                 identity_bound=True)
+    try:
+        b.start()
+    finally:
+        b.stop()
+        br.close()
+    assert len(br.requests) == 1
+    req = br.requests[0]
+    assert req["type"] == "RegisterManifest"
+    assert "token" not in req
+    assert len(req["arguments"]["internalToken"]) == 64
 
 
 if __name__ == "__main__":
