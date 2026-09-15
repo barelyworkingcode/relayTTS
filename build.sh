@@ -75,15 +75,19 @@ if [ -x "$RELAY" ]; then
         # (relay/docs/model-endpoint.md: empty allowed_models means NO
         # models for a service, the opposite of a project's default) — TTS
         # is meant to reach its one remote model, not every model relay's
-        # broker can reach.
-        REGISTER_CAPS=(
-            --capability manifest
-            --capability models
-            --allowed-model "$RELAYTTS_REMOTE_MODEL"
-        )
-        if [ -n "${RELAYTTS_REMOTE_CLONE_MODEL:-}" ]; then
-            REGISTER_CAPS+=(--allowed-model "$RELAYTTS_REMOTE_CLONE_MODEL")
-        fi
+        # broker can reach. Only grant it when the daemon actually talks to
+        # relay's model.sock: a plain https:// remote never calls relay's
+        # model endpoint, so granting `models` there would be an unused,
+        # unrevoked capability sitting on the service record.
+        REGISTER_CAPS=(--capability manifest)
+        case "$RELAYTTS_REMOTE_URL" in
+            unix:*)
+                REGISTER_CAPS+=(--capability models --allowed-model "$RELAYTTS_REMOTE_MODEL")
+                if [ -n "${RELAYTTS_REMOTE_CLONE_MODEL:-}" ]; then
+                    REGISTER_CAPS+=(--allowed-model "$RELAYTTS_REMOTE_CLONE_MODEL")
+                fi
+                ;;
+        esac
 
         "$RELAY" service register \
             --name relaytts-daemon \
