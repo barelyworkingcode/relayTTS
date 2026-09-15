@@ -124,7 +124,7 @@ RELAYTTS_REMOTE_URL=https://<host>:<port>/v1 \
 RELAYTTS_REMOTE_MODEL=<id-that-server-exposes> ./build.sh
 ```
 
-`RELAYTTS_REMOTE_URL` / `RELAYTTS_REMOTE_MODEL` are required — `build.sh` refuses to register the service without them, and `Config` refuses to start the daemon without them either. `build.sh` bakes them (plus `RELAYTTS_REMOTE_CLONE_MODEL`, `RELAYTTS_REMOTE_CA`, `RELAYTTS_REMOTE_PIN_SHA256` when set) into the service registration, so a host's address never has to enter the config file.
+`RELAYTTS_REMOTE_MODEL` is required — `build.sh` refuses to register the service without it, and `Config` refuses to start the daemon without it either. `RELAYTTS_REMOTE_URL` is required too *unless* relay is installed, in which case `build.sh` defaults it to relay's own model socket (see "Remote via relay's model socket" below). `build.sh` bakes the resolved values (plus `RELAYTTS_REMOTE_CLONE_MODEL`, `RELAYTTS_REMOTE_CA`, `RELAYTTS_REMOTE_PIN_SHA256` when set) into the service registration, so a host's address never has to enter the config file.
 
 Notes:
 
@@ -145,6 +145,41 @@ Fail-closed TLS with optional certificate pinning — see `daemon/pinned_transpo
   openssl s_client -connect host:port </dev/null 2>/dev/null | openssl x509 -fingerprint -sha256 -noout
   ```
 - There is no skip-verify / insecure flag.
+
+### Remote via relay's model socket
+
+`RELAYTTS_REMOTE_URL` also accepts `unix:<absolute path>` — HTTP over
+`AF_UNIX` against relay's own model endpoint (`relay/docs/model-endpoint.md`)
+instead of a directly-configured server. `build.sh` defaults to this
+(`unix:$HOME/Library/Application Support/relay/model.sock`) whenever relay is
+installed and no `RELAYTTS_REMOTE_URL` is given.
+
+- The base path is always `/v1` — the socket path names the socket file, not
+  a URL prefix.
+- **No `Authorization` or `x-api-key` header is ever sent on this path.**
+  Relay identifies the daemon by its launch identity (the kernel's audit
+  token on the connection), not by a header — a header would be judged as a
+  bearer credential instead and can only make the call worse. A configured
+  `RELAYTTS_REMOTE_API_KEY` (or whatever `api_key_env` names) is ignored,
+  with a one-line startup warning naming the variable, never its value.
+- `RELAYTTS_REMOTE_CA` / `RELAYTTS_REMOTE_PIN_SHA256` don't apply here —
+  there is no TLS layer on `AF_UNIX` — and `assert_transport_config` refuses
+  startup if either is set alongside a `unix:` URL, the same "would be a
+  false sense of safety" rule plain `http` already gets.
+- The path after `unix:` must be absolute; a relative one is refused at
+  startup with a clear message.
+- One connection is opened per daemon process and reused (HTTP keep-alive)
+  across requests rather than one dialed and torn down per synthesis.
+- relay's model endpoint returns 401 if this service doesn't hold the
+  `models` capability, and the same 404 for a model that's unknown as for
+  one that isn't in `--allowed-model`; 429 (admission timeout) and 503 (no
+  model host registered) are retried with backoff.
+- **Registering the `models` capability is presence-gated** — `build.sh`'s
+  `relay service register` call raises a real macOS confirmation dialog and
+  must be run at the console, not over SSH (see relayHarness's CLAUDE.md for
+  the general shape of this gate). If the service is already registered,
+  `build.sh` prints the exact `unregister`-then-`register` command needed to
+  pick up the capability change; there is no in-place update.
 
 ## Files
 
