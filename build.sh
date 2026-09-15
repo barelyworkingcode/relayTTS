@@ -20,15 +20,28 @@ if [ -x "$RELAY" ]; then
         echo "kokoro-daemon unregistered"
     fi
 
+    # With relay present, its own model.sock is the default remote endpoint:
+    # the daemon reaches its TTS model through relay's launch-identity auth
+    # (no bearer header — see daemon/pinned_transport.py's unix transport)
+    # instead of a directly-configured HTTPS endpoint. An explicit
+    # RELAYTTS_REMOTE_URL (e.g. talking to a server directly, or in dev)
+    # always wins.
+    if [ -z "${RELAYTTS_REMOTE_URL:-}" ]; then
+        RELAYTTS_REMOTE_URL="unix:$HOME/Library/Application Support/relay/model.sock"
+    fi
+
     if "$RELAY" service list 2>/dev/null | grep -q "relaytts-daemon"; then
         echo "Already registered with Relay. Daemon will use updated scripts."
-        # `service register` is the only way to set env; there is no update
-        # verb. So say so rather than silently ignoring a changed URL.
-        if [ -n "${RELAYTTS_REMOTE_URL:-}" ] || [ -n "${RELAYTTS_REMOTE_MODEL:-}" ]; then
-            echo "NOTE: a RELAYTTS_REMOTE_* variable is set but the service is" \
-                 "already registered. To change it, unregister first:"
-            echo "      $RELAY service unregister --name relaytts-daemon && ./build.sh"
-        fi
+        # `service register` is the only way to set env or capabilities;
+        # there is no update verb — it upserts and restates the whole
+        # record, so re-running with new values here has no effect on an
+        # already-registered service. Say so rather than silently ignoring
+        # a changed URL, model, or the new `models` capability.
+        echo "NOTE: relay service register has no update verb. To pick up a" \
+             "changed RELAYTTS_REMOTE_* variable, or the models capability /" \
+             "allowed-model grant this build.sh now registers, unregister" \
+             "first:"
+        echo "      $RELAY service unregister --name relaytts-daemon && ./build.sh"
     else
         # The daemon owns no model — RELAYTTS_REMOTE_URL / RELAYTTS_REMOTE_MODEL
         # are the deployment facts that point it at the server that does, and
@@ -58,11 +71,29 @@ if [ -x "$RELAY" ]; then
             REGISTER_ENV+=(--env "RELAYTTS_REMOTE_PIN_SHA256=$RELAYTTS_REMOTE_PIN_SHA256")
         fi
 
+        # `models` scopes this service to exactly the model(s) named below
+        # (relay/docs/model-endpoint.md: empty allowed_models means NO
+        # models for a service, the opposite of a project's default) — TTS
+        # is meant to reach its one remote model, not every model relay's
+        # broker can reach. Only grant it when the daemon actually talks to
+        # relay's model.sock: a plain https:// remote never calls relay's
+        # model endpoint, so granting `models` there would be an unused,
+        # unrevoked capability sitting on the service record.
+        REGISTER_CAPS=(--capability manifest)
+        case "$RELAYTTS_REMOTE_URL" in
+            unix:*)
+                REGISTER_CAPS+=(--capability models --allowed-model "$RELAYTTS_REMOTE_MODEL")
+                if [ -n "${RELAYTTS_REMOTE_CLONE_MODEL:-}" ]; then
+                    REGISTER_CAPS+=(--allowed-model "$RELAYTTS_REMOTE_CLONE_MODEL")
+                fi
+                ;;
+        esac
+
         "$RELAY" service register \
             --name relaytts-daemon \
             --command "$SCRIPT_DIR/daemon/daemon_wrapper.sh" \
             --autostart \
-            --capability manifest \
+            "${REGISTER_CAPS[@]}" \
             "${REGISTER_ENV[@]}"
         echo "Registered relaytts-daemon service with Relay (remote: $RELAYTTS_REMOTE_URL)"
     fi

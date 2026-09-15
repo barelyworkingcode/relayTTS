@@ -146,6 +146,47 @@ construction:
   cannot apply; leaving them set would be a false sense of safety).
 - There is no skip-verify / insecure flag, and none should be added.
 
+## Remote via relay's model socket
+
+`RELAYTTS_REMOTE_URL` also accepts `unix:<absolute path>`: HTTP over
+`AF_UNIX` against relay's model endpoint (`relay/docs/model-endpoint.md`)
+rather than a directly-configured server, base path `/v1` always (the
+socket path names the socket file, not a URL prefix). `build.sh` defaults to
+`unix:$HOME/Library/Application Support/relay/model.sock` when relay is
+installed and no `RELAYTTS_REMOTE_URL` is set.
+
+- **No `Authorization` / `x-api-key` header is ever sent on this transport.**
+  Relay's Auth order identifies the daemon by the kernel's audit token on
+  the connection (its launch identity), not by a header; a present header is
+  always judged as a bearer credential instead, which can only make the call
+  worse (401), never better. A configured `RELAYTTS_REMOTE_API_KEY` (or
+  `api_key_env`'s target) is therefore ignored, with a one-line warning
+  naming the variable — never its value — at construction.
+- CA/pin settings don't apply to a unix socket — there is no TLS layer —
+  and `assert_transport_config` refuses startup if either is set alongside a
+  `unix:` URL, the same false-sense-of-safety rule `http` already gets.
+- A relative path after `unix:` is refused at startup with a clear message:
+  the path is handed straight to `socket.connect()`, so a relative one would
+  silently resolve against the daemon's CWD rather than the operator's
+  intent.
+- `UnixSocketOpener` (`daemon/pinned_transport.py`) keeps one HTTP/1.1
+  keep-alive connection per engine, reused across requests and serialized by
+  a lock, rather than dialing and tearing down a connection per synthesis —
+  the shape the R-M1b security review calls out as a file-descriptor-leak
+  risk when done wrong on the upstream side of a broker.
+- relay's model endpoint 401s if this service doesn't hold the `models`
+  capability, and gives the identical 404 for a model that's unknown as for
+  one outside `--allowed-model` (relay's Scoping rule: a caller must not be
+  able to enumerate its grant by the shape of the error). 429 (admission
+  timeout) and 503 (no model host registered) get a bounded retry with
+  backoff — see `RemoteEngine._call_speech_endpoint`.
+- Registering the `models` capability (`build.sh`) is presence-gated: it
+  raises a real macOS confirmation dialog and must be run at the console.
+  `relay service register` has no update verb, so an already-registered
+  service needs `unregister` then `./build.sh` again to pick up the
+  capability or a changed `RELAYTTS_REMOTE_*` value; `build.sh` prints that
+  exact instruction when it detects the service is already registered.
+
 ## Protocol (TCP 9997)
 
 4-byte big-endian length prefix + JSON body. Single, batch, batch-streaming, and
@@ -168,13 +209,20 @@ RELAYTTS_REMOTE_URL=https://<host>:<port>/v1 \
 RELAYTTS_REMOTE_MODEL=<id-that-server-exposes> ./build.sh
 ```
 
-`build.sh` requires `RELAYTTS_REMOTE_URL` and `RELAYTTS_REMOTE_MODEL` when
-registering for the first time — there is no local fallback to start without
-them. `RELAYTTS_REMOTE_CLONE_MODEL`, `RELAYTTS_REMOTE_CA` and
-`RELAYTTS_REMOTE_PIN_SHA256` are baked into the registration when set.
+`build.sh` requires `RELAYTTS_REMOTE_MODEL` when registering for the first
+time, and `RELAYTTS_REMOTE_URL` too unless relay is installed — in which case
+it defaults to `unix:$HOME/Library/Application Support/relay/model.sock` (see
+"Remote via relay's model socket" above). `RELAYTTS_REMOTE_CLONE_MODEL`,
+`RELAYTTS_REMOTE_CA` and `RELAYTTS_REMOTE_PIN_SHA256` are baked into the
+registration when set; with relay present, registration also requests the
+`models` capability with `--allowed-model` for `RELAYTTS_REMOTE_MODEL` (and
+`RELAYTTS_REMOTE_CLONE_MODEL`, when set).
 
 `relay service` has no update verb, so changing any of these later means
-`relay service unregister --name relaytts-daemon` and re-running build.sh.
+`relay service unregister --name relaytts-daemon` and re-running build.sh —
+`build.sh` prints this exact command when it finds the service already
+registered. Registering (or re-registering) is presence-gated and must be
+run at the console, not over SSH.
 
 Manual run (no Relay): `python daemon/relaytts_daemon.py [--port 9997] [--idle-timeout 0]`.
 

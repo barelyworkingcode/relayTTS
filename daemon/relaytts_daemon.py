@@ -34,7 +34,7 @@ import numpy as np
 import soundfile as sf
 import yaml
 
-from pinned_transport import assert_transport_config, build_opener, parse_pins
+from pinned_transport import assert_transport_config, build_opener, is_unix_url, parse_pins
 
 DAEMON_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(DAEMON_DIR), "config.yaml")
@@ -398,6 +398,14 @@ class RemoteEngine:
     do talk to a server that authenticates.
     """
 
+    # Relay's model.sock 429s on an admission-timeout and 503s with no host
+    # registered — both mean "come back", not "the request is wrong" — so
+    # they get a bounded retry with backoff; every other status is reported
+    # on the first try.
+    _RETRYABLE_STATUS = (429, 503)
+    _MAX_ATTEMPTS = 3
+    _RETRY_BACKOFF_BASE_S = 0.5
+
     def __init__(self, raw: dict):
         raw = raw or {}
         # URL and model ids come from the environment first: they are
@@ -405,6 +413,11 @@ class RemoteEngine:
         # tracked config to point at its own endpoint.
         env_url = os.environ.get("RELAYTTS_REMOTE_URL")
         self.base_url = (env_url or raw.get("base_url") or "").rstrip("/")
+        # `unix:<path>` means HTTP over AF_UNIX against relay's model.sock:
+        # relay identifies this daemon by its launch identity on that
+        # socket, never by a header (relay/docs/model-endpoint.md's Auth
+        # order), so no CA/pin/API-key setting below applies to it.
+        self.is_unix = is_unix_url(self.base_url)
         self.model = os.environ.get("RELAYTTS_REMOTE_MODEL") or raw.get("model") or ""
         # Cloning renders through a different upstream checkpoint (the Base
         # model) than presets do, hence the separate id.
@@ -427,10 +440,29 @@ class RemoteEngine:
         self.pins = parse_pins(
             os.environ.get("RELAYTTS_REMOTE_PIN_SHA256") or raw.get("pin_sha256"))
         assert_transport_config(self.base_url, self.ca_file, self.pins)
+
+        if self.is_unix and self.api_key:
+            # Deliberate: an Authorization header on the unix path is judged
+            # as a bearer credential by relay's model endpoint, never as this
+            # service's own identity — sending one can only make the call
+            # worse (a mismatched-header 401), never better. Name the
+            # variable, never the value, since this print can reach a shared
+            # log.
+            warn_var = raw.get("api_key_env") or "RELAYTTS_REMOTE_API_KEY"
+            print(f"remote TTS: {warn_var} is set but ignored on the unix "
+                  "transport (relay identifies this service by its launch "
+                  "identity, not a bearer header)")
+            self.api_key = None
+
         self._opener = build_opener(self.base_url, self.ca_file, self.pins)
 
     @property
     def speech_url(self) -> str:
+        # Fixed base path: relay's model endpoint is rooted at /v1 regardless
+        # of the socket path after `unix:`, which names the socket file, not
+        # a URL prefix.
+        if self.is_unix:
+            return "unix://model.sock/v1/audio/speech"
         return f"{self.base_url}/audio/speech"
 
     @property
@@ -453,6 +485,44 @@ class RemoteEngine:
             if err:
                 return str(err)
         return text
+
+    @staticmethod
+    def _status_hint(code: int) -> str:
+        """A relay-specific hint prepended to the upstream's own error detail,
+        for the two statuses relay's model endpoint gives a fixed meaning to
+        regardless of what sits behind it (relay/docs/model-endpoint.md's
+        Auth order and Scoping)."""
+        if code == 401:
+            return "not authorised by relay: does this service hold the models capability? "
+        if code == 404:
+            return "model not allowed or unknown: check allowed_models — "
+        return ""
+
+    def _call_speech_endpoint(self, req: urllib.request.Request) -> bytes:
+        """POST `req` and return the response body, or raise RuntimeError.
+
+        429 (admission timeout) and 503 (no model host registered) mean
+        "come back", not "the request is wrong" — relay's own busy/
+        unavailable signals — so they get a bounded retry with backoff;
+        every other status is reported on the first try.
+        """
+        for attempt in range(self._MAX_ATTEMPTS):
+            try:
+                with self._opener.open(req, timeout=self.timeout) as resp:
+                    return resp.read()
+            except urllib.error.HTTPError as e:
+                detail = self._error_detail(e.read())
+                if (e.code in self._RETRYABLE_STATUS
+                        and attempt < self._MAX_ATTEMPTS - 1):
+                    time.sleep(self._RETRY_BACKOFF_BASE_S * (2 ** attempt))
+                    continue
+                raise RuntimeError(
+                    f"remote TTS {self.label} returned HTTP {e.code}: "
+                    f"{self._status_hint(e.code)}{detail}") from None
+            except urllib.error.URLError as e:
+                raise RuntimeError(
+                    f"remote TTS {self.label} unreachable: {e.reason}") from None
+        raise AssertionError("unreachable: loop always returns or raises")
 
     def synthesize(self, spec: dict, text: str, lang_code: str,
                    instruct: str | None, temperature: float,
@@ -483,16 +553,7 @@ class RemoteEngine:
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
 
-        try:
-            with self._opener.open(req, timeout=self.timeout) as resp:
-                wav = resp.read()
-        except urllib.error.HTTPError as e:
-            raise RuntimeError(
-                f"remote TTS {self.label} returned HTTP {e.code}: "
-                f"{self._error_detail(e.read())}") from None
-        except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"remote TTS {self.label} unreachable: {e.reason}") from None
+        wav = self._call_speech_endpoint(req)
 
         try:
             audio, sr = sf.read(io.BytesIO(wav), dtype="float32")

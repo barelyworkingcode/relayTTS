@@ -15,12 +15,15 @@ import json
 import os
 import shutil
 import socket
+import socketserver
 import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import urllib.error
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -858,6 +861,266 @@ def test_tls_pin_mismatch_rejects_valid_cert_from_wrong_leaf(tmp_path):
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+# ── unix:<path> transport: relay's model.sock ──────────────────────
+#
+# A real OpenAI-compatible HTTP server on a real AF_UNIX socket — no mock of
+# the socket layer — mirroring _FakeBridge's pattern above. `responses` is a
+# list of (status, error_body_or_None) consumed in order; once exhausted the
+# last entry repeats, so a test that wants "always 503" just passes one entry.
+
+class _FakeModelSockHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep-alive, so the reuse test means something
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length)
+        payload = json.loads(raw.decode("utf-8")) if raw else {}
+        self.server.record({
+            "path": self.path,
+            "headers": {k.lower(): v for k, v in self.headers.items()},
+            "payload": payload,
+        })
+        status, error_body = self.server.next_response()
+        if status == 200:
+            wav = _wav_bytes(0.1, 24000)
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Content-Length", str(len(wav)))
+            self.end_headers()
+            self.wfile.write(wav)
+        else:
+            body = json.dumps(error_body or {"error": {"message": "denied"}}).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class _FakeModelSockServer(socketserver.ThreadingUnixStreamServer):
+    daemon_threads = True
+
+    def __init__(self, sock_path, responses):
+        self._lock = threading.Lock()
+        self.requests = []
+        self.connection_count = 0
+        self.responses = list(responses)
+        super().__init__(sock_path, _FakeModelSockHandler)
+
+    def get_request(self):
+        conn, addr = super().get_request()
+        with self._lock:
+            self.connection_count += 1
+        return conn, addr
+
+    def record(self, entry):
+        with self._lock:
+            self.requests.append(entry)
+
+    def next_response(self):
+        with self._lock:
+            if len(self.responses) > 1:
+                return self.responses.pop(0)
+            return self.responses[0]
+
+
+@contextmanager
+def _model_sock_server(responses=((200, None),)):
+    # AF_UNIX paths cap at ~104 bytes on macOS; pytest's tmp_path is too deep
+    # (see _FakeBridge above), so this gets its own short-lived base under /tmp.
+    d = tempfile.mkdtemp(prefix="rtts-model-")
+    sock_path = os.path.join(d, "model.sock")
+    srv = _FakeModelSockServer(sock_path, responses)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield srv, sock_path
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_unix_url_relative_path_refused():
+    for bad in ("unix:relative/path.sock", "unix:", "unix:~/model.sock"):
+        try:
+            pinned_transport.assert_transport_config(bad, None, [])
+        except ValueError as e:
+            assert "absolute path" in str(e)
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
+
+
+def test_unix_url_absolute_path_is_ok():
+    pinned_transport.assert_transport_config("unix:/tmp/model.sock", None, [])
+
+
+def test_unix_url_with_ca_file_is_fatal(tmp_path):
+    ca = tmp_path / "ca.pem"
+    ca.write_text("irrelevant — rejected before it would be read")
+    try:
+        pinned_transport.assert_transport_config("unix:/tmp/model.sock", str(ca), [])
+    except ValueError as e:
+        assert "unix" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_unix_url_with_pins_is_fatal():
+    try:
+        pinned_transport.assert_transport_config("unix:/tmp/model.sock", None, ["a" * 64])
+    except ValueError as e:
+        assert "unix" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_remote_engine_rejects_relative_unix_path():
+    try:
+        RemoteEngine({"base_url": "unix:relative.sock", "model": "m"})
+    except ValueError as e:
+        assert "absolute path" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_unix_transport_sends_expected_request_no_auth_header():
+    with _model_sock_server() as (srv, sock_path):
+        engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "test/model"})
+        assert engine.speech_url == "unix://model.sock/v1/audio/speech"
+        audio = engine.synthesize({"kind": "preset", "speaker": "ryan"}, "Hello.",
+                                  "english", "Confident.", 0.9, 24000)
+        assert len(audio) > 0
+        assert len(srv.requests) == 1
+        req = srv.requests[0]
+        assert req["path"] == "/v1/audio/speech"
+        assert req["payload"]["model"] == "test/model"
+        assert req["payload"]["voice"] == "ryan"
+        assert "authorization" not in req["headers"]
+        assert "x-api-key" not in req["headers"]
+
+
+def test_unix_transport_ignores_configured_api_key_with_warning(monkeypatch, capsys):
+    with _model_sock_server() as (srv, sock_path):
+        monkeypatch.setenv("RELAYTTS_REMOTE_API_KEY", "s3cret-value")
+        engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "m"})
+        out = capsys.readouterr().out
+        assert "RELAYTTS_REMOTE_API_KEY" in out
+        assert "s3cret-value" not in out
+        assert engine.api_key is None
+
+        engine.synthesize({"kind": "preset", "speaker": "ryan"}, "Hi.", "english", None, 0.9, 24000)
+        assert "authorization" not in srv.requests[0]["headers"]
+
+
+def test_unix_transport_api_key_canary_never_sent_or_logged(monkeypatch, capsys):
+    """The value must not leak into a request header or anything printed,
+    whatever the daemon does with it internally."""
+    canary = "CANARY-" + "f" * 40
+    with _model_sock_server() as (srv, sock_path):
+        monkeypatch.setenv("RELAYTTS_REMOTE_API_KEY", canary)
+        engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "m"})
+        engine.synthesize({"kind": "preset", "speaker": "ryan"}, "Hi.", "english", None, 0.9, 24000)
+    out = capsys.readouterr().out
+    assert canary not in out
+    assert canary not in json.dumps(srv.requests)
+
+
+def test_https_config_still_sends_bearer_when_configured(tmp_path, monkeypatch):
+    """Guards against the unix-only api_key suppression leaking onto the
+    https path — same assertion as test_remote_sends_bearer_only_when_configured,
+    kept here as a contrast to the unix behaviour above."""
+    monkeypatch.setenv("RELAYTTS_REMOTE_API_KEY", "tok")
+    cfg = _make_config(str(tmp_path), remote=REMOTE_BLOCK)
+    seen = _capture_request(cfg.remote, monkeypatch)
+    cfg.remote.synthesize(cfg.resolve("ryan"), "Hi.", "english", None, 0.9, 24000)
+    assert seen["headers"]["Authorization"] == "Bearer tok"
+
+
+def test_unix_transport_401_gives_clear_message():
+    with _model_sock_server(responses=[(401, {"error": "unauthorized"})]) as (srv, sock_path):
+        engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "m"})
+        with pytest.raises(RuntimeError, match="not authorised by relay.*models capability"):
+            engine.synthesize({"kind": "preset", "speaker": "ryan"}, "hi", "english", None, 0.9, 24000)
+
+
+def test_unix_transport_404_gives_clear_message():
+    with _model_sock_server(responses=[(404, {"error": "not found"})]) as (srv, sock_path):
+        engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "m"})
+        with pytest.raises(RuntimeError, match="model not allowed or unknown"):
+            engine.synthesize({"kind": "preset", "speaker": "ryan"}, "hi", "english", None, 0.9, 24000)
+
+
+def test_unix_transport_429_retries_then_succeeds(monkeypatch):
+    monkeypatch.setattr(relaytts_daemon.time, "sleep", lambda s: None)
+    responses = [(429, {"error": "rate_limited"}), (429, {"error": "rate_limited"}), (200, None)]
+    with _model_sock_server(responses=responses) as (srv, sock_path):
+        engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "m"})
+        audio = engine.synthesize({"kind": "preset", "speaker": "ryan"}, "hi", "english", None, 0.9, 24000)
+        assert len(audio) > 0
+        assert len(srv.requests) == 3
+
+
+def test_unix_transport_503_retries_then_gives_up(monkeypatch):
+    monkeypatch.setattr(relaytts_daemon.time, "sleep", lambda s: None)
+    with _model_sock_server(responses=[(503, {"error": "model host unavailable"})]) as (srv, sock_path):
+        engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "m"})
+        with pytest.raises(RuntimeError, match="HTTP 503"):
+            engine.synthesize({"kind": "preset", "speaker": "ryan"}, "hi", "english", None, 0.9, 24000)
+        assert len(srv.requests) == RemoteEngine._MAX_ATTEMPTS
+
+
+def test_unix_transport_reuses_connection_across_requests():
+    with _model_sock_server() as (srv, sock_path):
+        engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "m"})
+        for _ in range(20):
+            engine.synthesize({"kind": "preset", "speaker": "ryan"}, "hi", "english", None, 0.9, 24000)
+        assert len(srv.requests) == 20
+        # Bounded well under N: a fresh connection per call would be 20.
+        assert srv.connection_count <= 2
+
+
+def test_unix_transport_decodes_chunked_response():
+    """Transfer-Encoding: chunked, written by hand — exercises the same
+    http.client chunked-decoding path a streaming upstream would use."""
+    class _ChunkedHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            wav = _wav_bytes(0.1, 24000)
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/wav")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            mid = len(wav) // 2
+            for chunk in (wav[:mid], wav[mid:]):
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+            self.wfile.write(b"0\r\n\r\n")
+
+        def log_message(self, *a):
+            pass
+
+    d = tempfile.mkdtemp(prefix="rtts-model-chunked-")
+    sock_path = os.path.join(d, "model.sock")
+    srv = socketserver.ThreadingUnixStreamServer(sock_path, _ChunkedHandler)
+    srv.daemon_threads = True
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "m"})
+        audio = engine.synthesize({"kind": "preset", "speaker": "ryan"}, "hi", "english", None, 0.9, 24000)
+        assert len(audio) > 0
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # ── framing: probe vs truncation ──────────────────────────────────
