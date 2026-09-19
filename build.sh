@@ -4,7 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Ensure conda environment exists
-if ! conda info --envs 2>/dev/null | grep -q "^relaytts "; then
+CONDA_ENVS="$(conda info --envs 2>/dev/null || true)"
+if ! grep -q "^relaytts " <<< "$CONDA_ENVS"; then
     echo "Setting up conda environment..."
     "$SCRIPT_DIR/setup_env.sh"
 fi
@@ -14,7 +15,10 @@ RELAY="/Applications/Relay.app/Contents/MacOS/relay"
 if [ -x "$RELAY" ]; then
     # Unregister kokoro-daemon if it's still registered — relayTTS is the
     # drop-in replacement and the two daemons must not both bind port 9997.
-    if "$RELAY" service list 2>/dev/null | grep -q "kokoro-daemon"; then
+    # Capture before grep: `service list | grep -q` under pipefail exits 141
+    # (SIGPIPE) when grep exits on a match before the list finishes writing.
+    SERVICE_LIST="$("$RELAY" service list 2>/dev/null || true)"
+    if grep -q "kokoro-daemon" <<< "$SERVICE_LIST"; then
         echo "Unregistering kokoro-daemon (replaced by relaytts-daemon)..."
         "$RELAY" service unregister --name kokoro-daemon
         echo "kokoro-daemon unregistered"
@@ -30,7 +34,7 @@ if [ -x "$RELAY" ]; then
         RELAYTTS_REMOTE_URL="unix:$HOME/Library/Application Support/relay/model.sock"
     fi
 
-    if "$RELAY" service list 2>/dev/null | grep -q "relaytts-daemon"; then
+    if grep -q "relaytts-daemon" <<< "$SERVICE_LIST"; then
         echo "Already registered with Relay. Daemon will use updated scripts."
         # `service register` is the only way to set env or capabilities;
         # there is no update verb — it upserts and restates the whole
