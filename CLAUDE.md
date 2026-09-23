@@ -37,7 +37,7 @@ No relay credential is ever in the daemon's environment or argv (any
 same-user process can read both on macOS). Relay launches the service with
 `RELAY_BRIDGE_SOCKET`, `RELAY_SERVICE_ID` and `RELAY_LAUNCH_FD=3`; fd 3 is a
 pipe holding a single-use 64-lowercase-hex launch secret. The contract is
-`../spec-launch-identity.md`.
+`../relay/docs/launch-identity.md`.
 
 - First thing in `main()`, before config loading or anything that can spawn,
   `establish_launch_identity()` removes `RELAY_LAUNCH_FD` from `os.environ`,
