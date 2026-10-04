@@ -238,7 +238,7 @@ def test_normalize_clone_drops_ref_audio_outside_dir(tmp_path, capsys):
         {"id": "escapee", "ref_audio": str(tmp_path / "elsewhere.wav"), "ref_text": "hi"},
     ])
     assert cfg.voice_counts()["clone"] == 0
-    assert "must be inside" in capsys.readouterr().out
+    assert "must be inside" in capsys.readouterr().err
 
 
 def test_build_clone_schema_shape():
@@ -1009,7 +1009,7 @@ def test_unix_transport_ignores_configured_api_key_with_warning(monkeypatch, cap
     with _model_sock_server() as (srv, sock_path):
         monkeypatch.setenv("RELAYTTS_REMOTE_API_KEY", "s3cret-value")
         engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "m"})
-        out = capsys.readouterr().out
+        out = capsys.readouterr().err
         assert "RELAYTTS_REMOTE_API_KEY" in out
         assert "s3cret-value" not in out
         assert engine.api_key is None
@@ -1026,7 +1026,7 @@ def test_unix_transport_api_key_canary_never_sent_or_logged(monkeypatch, capsys)
         monkeypatch.setenv("RELAYTTS_REMOTE_API_KEY", canary)
         engine = RemoteEngine({"base_url": f"unix:{sock_path}", "model": "m"})
         engine.synthesize({"kind": "preset", "speaker": "ryan"}, "Hi.", "english", None, 0.9, 24000)
-    out = capsys.readouterr().out
+    out = capsys.readouterr().err
     assert canary not in out
     assert canary not in json.dumps(srv.requests)
 
