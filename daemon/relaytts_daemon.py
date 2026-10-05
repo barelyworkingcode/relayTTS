@@ -12,6 +12,7 @@ Voices and per-voice delivery (`instruct`) live in config.yaml, not in code.
 """
 import argparse
 import base64
+import contextlib
 import io
 import json
 import math
@@ -34,6 +35,7 @@ import numpy as np
 import soundfile as sf
 import yaml
 
+import log_line
 from pinned_transport import assert_transport_config, build_opener, is_unix_url, parse_pins
 
 DAEMON_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -142,9 +144,10 @@ class Config:
         try:
             with open(self.custom_voices_path, "w") as f:
                 json.dump({"voices": [], "clones": []}, f, indent=2)
-            print(f"Seeded empty custom voices file: {self.custom_voices_path}")
+            log_line.info("seeded empty custom voices file", op="voices.seed")
         except OSError as e:
-            print(f"Could not seed {self.custom_voices_path}: {e}")
+            log_line.warn("could not seed custom voices file", op="voices.seed",
+                          error=type(e).__name__)
 
     def _normalize_custom(self, entry: dict, known_speakers: set) -> dict | None:
         """Coerce one voices.json row into a render spec, or None if unusable.
@@ -157,7 +160,9 @@ class Config:
             if not vid:
                 return None
             if speaker not in known_speakers:
-                print(f"custom voice {vid!r}: unknown base_speaker {speaker!r}; skipping")
+                log_line.warn("custom voice skipped: unknown base_speaker",
+                              op="voices.load", status="denied", voice=vid,
+                              error="unknown base_speaker", base_speaker=speaker)
                 return None
             instruct = entry.get("instruct")
             return {
@@ -172,7 +177,8 @@ class Config:
                 "kind": "custom",
             }
         except Exception as e:
-            print(f"custom voice entry skipped ({e})")
+            log_line.warn("custom voice entry skipped", op="voices.load",
+                          error=type(e).__name__)
             return None
 
     def clone_audio_path(self, ref_audio: str) -> str | None:
@@ -205,12 +211,15 @@ class Config:
             if not vid:
                 return None
             if not ref_audio_raw or not ref_text:
-                print(f"clone voice {vid!r}: needs ref_audio and ref_text; skipping")
+                log_line.warn("clone voice skipped: needs ref_audio and ref_text",
+                              op="voices.load", status="denied", voice=vid,
+                              error="missing ref_audio or ref_text")
                 return None
             ref_audio = self.clone_audio_path(ref_audio_raw)
             if ref_audio is None:
-                print(f"clone voice {vid!r}: ref_audio must be inside "
-                      f"{self.clone_audio_dir}; skipping")
+                log_line.warn("clone voice skipped: ref_audio must be inside the clone audio dir",
+                              op="voices.load", status="denied", voice=vid,
+                              error="ref_audio outside clone audio dir")
                 return None
             return {
                 "id": vid,
@@ -224,7 +233,8 @@ class Config:
                 "kind": "clone",
             }
         except Exception as e:
-            print(f"clone voice entry skipped ({e})")
+            log_line.warn("clone voice entry skipped", op="voices.load",
+                          error=type(e).__name__)
             return None
 
     def _read_dynamic(self) -> tuple:
@@ -235,7 +245,8 @@ class Config:
         except FileNotFoundError:
             return [], []
         except (OSError, json.JSONDecodeError) as e:
-            print(f"custom voices: cannot read {self.custom_voices_path}: {e}; ignoring")
+            log_line.warn("custom voices unreadable, ignoring", op="voices.load",
+                          error=type(e).__name__)
             return [], []
         known = {v["speaker"] for v in self._builtin}
         custom = [self._normalize_custom(e, known)
@@ -305,6 +316,11 @@ class Config:
             "speaker": v["speaker"],
             "instruct": v.get("instruct") or self.default_instruct,
         }
+
+
+def _voice_attr(voice):
+    """A voice id safe to log: a short string, else empty."""
+    return voice[:64] if isinstance(voice, str) else ""
 
 
 # ── Audio post-processing ─────────────────────────────────────────
@@ -446,12 +462,13 @@ class RemoteEngine:
             # as a bearer credential by relay's model endpoint, never as this
             # service's own identity — sending one can only make the call
             # worse (a mismatched-header 401), never better. Name the
-            # variable, never the value, since this print can reach a shared
-            # log.
+            # variable, never the value, since this log line can reach a
+            # shared log.
             warn_var = raw.get("api_key_env") or "RELAYTTS_REMOTE_API_KEY"
-            print(f"remote TTS: {warn_var} is set but ignored on the unix "
-                  "transport (relay identifies this service by its launch "
-                  "identity, not a bearer header)")
+            log_line.warn(
+                f"remote TTS: {warn_var} is set but ignored on the unix "
+                "transport (relay identifies this service by its launch "
+                "identity, not a bearer header)", op="service.start")
             self.api_key = None
 
         self._opener = build_opener(self.base_url, self.ca_file, self.pins)
@@ -550,6 +567,11 @@ class RemoteEngine:
         req = urllib.request.Request(
             self.speech_url, data=json.dumps(payload).encode("utf-8"),
             method="POST", headers={"Content-Type": "application/json"})
+        # The trace id means nothing off the box, so it only goes to an
+        # engine reached over a unix socket or loopback.
+        trace_id = log_line.current_trace_id()
+        if trace_id and log_line.is_on_box_url(self.base_url):
+            req.add_header("X-Trace-Id", trace_id)
         if self.api_key:
             req.add_header("Authorization", f"Bearer {self.api_key}")
 
@@ -606,7 +628,9 @@ class RelayTTSDaemon:
             return
         while self.running:
             if self.check_idle_timeout():
-                print(f"Daemon idle for {self.idle_timeout // 60} minutes, shutting down...")
+                log_line.info(
+                    f"daemon idle for {self.idle_timeout // 60} minutes, shutting down",
+                    op="service.stop")
                 self.running = False
                 break
             time.sleep(30)
@@ -652,10 +676,10 @@ class RelayTTSDaemon:
             except Exception:
                 raise RuntimeError(
                     f"clone voice {voice!r}: ref_audio is not decodable audio") from None
-            descr = f"clone:{os.path.basename(ref_audio)}"
+            engine_attr = "clone"
         else:
             instruct = instruct or spec["instruct"]
-            descr = f"speaker={spec['speaker']}"
+            engine_attr = "speaker"
 
         audio = self.engine.synthesize(
             spec, text, lang_code, instruct, self.cfg.temperature, self.cfg.sample_rate)
@@ -680,8 +704,11 @@ class RelayTTSDaemon:
 
         rtf = generation_time / duration if duration > 0 else 0
         self._last_rtf = round(rtf, 3)
-        print(f"Generated: {duration:.2f}s audio in {generation_time:.2f}s "
-              f"(RTF: {rtf:.2f}x) voice={voice or self.cfg.default_voice} {descr}")
+        log_line.debug(
+            f"generated {duration:.2f}s audio in {generation_time:.2f}s "
+            f"(RTF: {rtf:.2f}x)", op="tts.generate",
+            duration_ms=int(generation_time * 1000),
+            voice=_voice_attr(voice) or self.cfg.default_voice, engine=engine_attr)
 
         return wav_bytes, {
             "sample_rate": self.cfg.sample_rate,
@@ -736,33 +763,57 @@ class RelayTTSDaemon:
     # ── Client handling ───────────────────────────────────────────
 
     def handle_client(self, client_socket, addr):
+        # Trace scope opens once the request names its id; until then (and
+        # for a bad frame) no id is in scope.
+        scope = contextlib.ExitStack()
+        started = time.monotonic()
+        op = "tts.synthesize"
+        # Exactly one end line per handled request; `end` is set where
+        # the request is decided and written once in `finally`.
+        end = None
+
+        def elapsed_ms():
+            return int((time.monotonic() - started) * 1000)
+
+        def refuse(reason, response, **attrs):
+            nonlocal end
+            end = ("warn", f"request refused: {reason}", "denied", reason, attrs)
+            self._send_response(client_socket, response)
+
         try:
             self.update_activity()
             request = self._recv_request(client_socket)
+
+            scope.enter_context(log_line.trace_scope(
+                log_line.accept_trace_id(request.get("trace_id"))))
 
             # Batch (streaming or not)
             if "batch" in request:
                 batch = request["batch"]
                 if not isinstance(batch, list):
-                    self._send_response(client_socket,
-                                        {"success": False, "error": "batch must be a list"})
+                    refuse("batch must be a list",
+                           {"success": False, "error": "batch must be a list"})
                     return
                 if len(batch) > MAX_BATCH_ITEMS:
-                    self._send_response(client_socket, {
+                    refuse("batch too large", {
                         "success": False,
                         "error": f"batch too large ({len(batch)} > {MAX_BATCH_ITEMS} items)",
-                    })
+                    }, items=len(batch))
                     return
                 if request.get("stream", False):
-                    self._handle_batch_streaming(batch, client_socket)
+                    ok_items = self._handle_batch_streaming(batch, client_socket)
                 else:
-                    self._handle_batch(batch, client_socket)
+                    ok_items = self._handle_batch(batch, client_socket)
+                end = ("info", "batch synthesized", "ok", "",
+                       {"items": len(batch), "ok_items": ok_items})
                 return
 
             # List voices
             if request.get("action") == "list_voices":
+                op = "tts.list_voices"
                 self._send_response(client_socket,
                                     {"success": True, "voices": self.cfg.public_voices()})
+                end = ("info", "voices listed", "ok", "", {})
                 return
 
             # Single request. speed/instruct/gain default to None (not 1.0) so an
@@ -775,7 +826,7 @@ class RelayTTSDaemon:
             gain = request.get("gain")
 
             if not text:
-                self._send_response(client_socket, {"success": False, "error": "No text provided"})
+                refuse("no text", {"success": False, "error": "No text provided"})
                 return
 
             wav_bytes, timing = self.synthesize(text, voice, speed, lang_code, instruct, gain)
@@ -786,18 +837,30 @@ class RelayTTSDaemon:
                 "audio_base64": audio_b64,
                 **timing,
             })
+            end = ("info", "synthesized", "ok", "",
+                   {"voice": _voice_attr(voice) or self.cfg.default_voice})
 
         except ClientDisconnected:
             # A port probe, or a client that hung up before asking anything.
             # Nothing to answer and nothing worth saying.
             return
         except Exception as e:
-            print(f"Error handling client {addr}: {e}")
+            # Only a plain ValueError (raised here, with our own wording) has its
+            # text logged. Every other type, RuntimeError and http/connection
+            # errors included, can embed a remote body or address: type only.
+            msg = " ".join(str(e).split())[:120] if type(e) is ValueError else ""
+            end = ("error", "request failed", "error",
+                   f"{type(e).__name__}: {msg}" if msg else type(e).__name__, {})
             try:
                 self._send_response(client_socket, {"success": False, "error": str(e)})
             except Exception:
                 pass
         finally:
+            if end is not None:
+                level, msg, status, error, attrs = end
+                log_line.log(level, msg, op=op, status=status, error=error,
+                             duration_ms=elapsed_ms(), **attrs)
+            scope.close()
             client_socket.close()
 
     def _handle_batch_streaming(self, batch_items, client_socket):
@@ -833,6 +896,7 @@ class RelayTTSDaemon:
             (json.dumps({"type": "complete", "total_items": total, "successful_items": successful}) + "\n")
             .encode("utf-8")
         )
+        return successful
 
     def _handle_batch(self, batch_items, client_socket):
         """Process batch items, return all results at once."""
@@ -858,6 +922,7 @@ class RelayTTSDaemon:
             "total_items": len(results),
             "successful_items": sum(1 for r in results if r["success"]),
         })
+        return sum(1 for r in results if r["success"])
 
     # ── Server lifecycle ──────────────────────────────────────────
 
@@ -867,7 +932,8 @@ class RelayTTSDaemon:
         # Nothing to load: no model, no weights, no generation thread. A bad
         # endpoint surfaces per-request rather than blocking startup, so the
         # daemon still serves list_voices if the remote host is booting behind us.
-        print(f"Remote engine: {self.engine.label} (model={self.engine.model})")
+        log_line.info(f"remote engine: {self.engine.label} (model={self.engine.model})",
+                      op="service.start")
 
         # Enhanced-service surface for relay's settings UI (status + voices.json
         # editor). Non-fatal: TTS on 9997 must work even if the inspector doesn't.
@@ -885,11 +951,10 @@ class RelayTTSDaemon:
         self.sock.bind((self.host, self.port))
         self.sock.listen(LISTEN_BACKLOG)
 
-        print(f"relayTTS Daemon started on {self.host}:{self.port}")
-        if self.idle_timeout > 0:
-            print(f"Auto-shutdown after {self.idle_timeout // 60} minutes idle")
-        else:
-            print("Idle timeout disabled")
+        idle = (f"auto-shutdown after {self.idle_timeout // 60} minutes idle"
+                if self.idle_timeout > 0 else "idle timeout disabled")
+        log_line.info(f"relayTTS daemon started on {self.host}:{self.port}; {idle}",
+                      op="service.start")
 
         self.update_activity()
 
@@ -911,10 +976,11 @@ class RelayTTSDaemon:
                     continue
                 except socket.error:
                     if self.running:
-                        print("Socket error")
+                        log_line.error("socket error on accept", op="service.accept",
+                                       error="socket.error")
                     break
         except KeyboardInterrupt:
-            print("\nStopping daemon...")
+            log_line.info("stopping daemon (interrupt)", op="service.stop")
         finally:
             self.stop()
 
@@ -927,7 +993,7 @@ class RelayTTSDaemon:
                 pass
         if self.sock:
             self.sock.close()
-        print("Daemon stopped")
+        log_line.info("daemon stopped", op="service.stop")
 
     # ── Relay enhanced-service surface ────────────────────────────
 
@@ -938,7 +1004,8 @@ class RelayTTSDaemon:
         try:
             from relay_bridge import RelayBridge
         except Exception as e:
-            print(f"relay bridge module unavailable ({e}); inspector disabled")
+            log_line.warn("relay bridge module unavailable; inspector disabled",
+                          op="service.start", error=type(e).__name__)
             return
         bridge = RelayBridge(
             status_provider=self._status_payload,
@@ -948,14 +1015,17 @@ class RelayTTSDaemon:
             identity_bound=self.relay_identity_bound,
         )
         if not bridge.enabled:
-            print("Standalone mode (no RELAY_LAUNCH_FD); settings inspector disabled")
+            log_line.info("standalone mode (no RELAY_LAUNCH_FD); settings inspector disabled",
+                          op="service.start")
             return
         try:
             bridge.start()
             self._bridge = bridge
-            print("Registered manifest with relay — settings inspector enabled")
+            log_line.info("registered manifest with relay; settings inspector enabled",
+                          op="service.start")
         except Exception as e:
-            print(f"relay bridge registration failed (non-fatal): {e}")
+            log_line.warn("relay bridge registration failed (non-fatal)",
+                          op="service.start", error=type(e).__name__)
 
     def _status_payload(self) -> dict:
         """Read-only snapshot relay polls for the inspector."""
@@ -985,9 +1055,10 @@ class RelayTTSDaemon:
                 self._voices_mtime = mtime
                 try:
                     n = self.cfg.reload_custom()
-                    print(f"Reloaded custom voices ({n}) from {self.cfg.custom_voices_path}")
+                    log_line.info(f"reloaded custom voices ({n})", op="voices.reload")
                 except Exception as e:
-                    print(f"custom voices reload failed: {e}")
+                    log_line.warn("custom voices reload failed", op="voices.reload",
+                                  error=type(e).__name__)
             time.sleep(1.5)
 
 
@@ -998,10 +1069,11 @@ def establish_relay_identity() -> bool:
     try:
         bound = establish_launch_identity()
     except LaunchIdentityError as e:
-        print(f"relay launch identity failed: {e}", file=sys.stderr)
+        log_line.error("relay launch identity failed", op="service.start",
+                       error=type(e).__name__)
         sys.exit(78)
     if bound:
-        print("Relay launch identity established")
+        log_line.info("relay launch identity established", op="service.start")
     return bound
 
 
@@ -1023,8 +1095,9 @@ def main():
 
     config = Config(args.config, custom_voices_path=args.custom_voices)
     counts = config.voice_counts()
-    print(f"Loaded config: {args.config} ({counts['builtin']} built-in + "
-          f"{counts['custom']} custom voices, default={config.default_voice})")
+    log_line.info(f"loaded config: {args.config} ({counts['builtin']} built-in + "
+                  f"{counts['custom']} custom voices, default={config.default_voice})",
+                  op="service.start")
     daemon = RelayTTSDaemon(config, host=args.host, port=args.port, idle_timeout=args.idle_timeout,
                             relay_identity_bound=relay_identity_bound)
     daemon.start()
