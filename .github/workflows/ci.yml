@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to the same PR makes the older run's answer worthless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      # The daemon is a thin protocol shell: no model, no Apple-only package.
+      # Two tests drive the real ffmpeg time-stretch; without it they skip.
+      - name: install ffmpeg
+        run: sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: install test dependencies
+        run: python -m pip install numpy soundfile pyyaml pytest
+      # -rs lists every skip with its reason in the log.
+      - name: pytest
+        run: python -m pytest daemon/test_relaytts.py -q -rs
