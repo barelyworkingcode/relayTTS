@@ -1690,3 +1690,7 @@ if __name__ == "__main__":
     total = len(fns) - skipped
     print(f"\n{passed}/{total} passed, {skipped} skipped (install pytest to run all)")
     sys.exit(0 if passed == total else 1)
+
+
+def test_ci_break_scratch():
+    assert False, "deliberate CI break"
